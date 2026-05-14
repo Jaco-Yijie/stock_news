@@ -1,0 +1,571 @@
+from __future__ import annotations
+
+import json
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from html import unescape
+from threading import Lock
+from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
+
+import pandas as pd
+import requests
+
+try:
+    from pandas.core.strings.accessor import StringMethods
+except ImportError:
+    StringMethods = None
+
+try:
+    import akshare as ak
+except ImportError as exc:
+    ak = None
+    AKSHARE_IMPORT_ERROR: ImportError | None = exc
+else:
+    AKSHARE_IMPORT_ERROR = None
+
+from sectors import EVENT_TO_SECTORS, EXTERNAL_EVENTS, SECTORS
+
+
+DEFAULT_TIMEOUT = 10
+EASTMONEY_SEARCH_URL = "https://search-api-web.eastmoney.com/search/jsonp"
+DISPLAY_COLUMNS = ["标题", "来源媒体", "发布时间", "原文链接"]
+EXTERNAL_EVENT_COLUMNS = ["event_category", "related_sectors", "reason"]
+TITLE_COLUMNS = ["新闻标题", "标题", "title"]
+SOURCE_COLUMNS = ["文章来源", "来源", "媒体", "source"]
+TIME_COLUMNS = ["发布时间", "时间", "日期", "publish_time"]
+LINK_COLUMNS = ["新闻链接", "链接", "url", "link"]
+CONTENT_COLUMNS = ["新闻内容", "内容", "摘要", "content"]
+REQUEST_HEADERS = {
+    "Accept": "*/*",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/142.0.0.0 Safari/537.36"
+    ),
+}
+PANDAS_REPLACE_PATCH_LOCK = Lock()
+HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+NON_WORD_PATTERN = re.compile(r"[\W_]+", re.UNICODE)
+TITLE_SIMILARITY_THRESHOLD = 0.94
+
+
+@dataclass(frozen=True)
+class SectorResult:
+    data: pd.DataFrame
+    error: str | None = None
+    warnings: tuple[str, ...] = ()
+
+
+def _empty_news_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=[*DISPLAY_COLUMNS, "匹配关键词", "新闻内容"])
+
+
+def _pick_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for column in candidates:
+        if column in df.columns:
+            return column
+    return None
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    text = unescape(str(value))
+    for old, new in (
+        ("\u3000", " "),
+        ("\xa0", " "),
+        ("\r", " "),
+        ("\n", " "),
+        ("\t", " "),
+        ("<em>", ""),
+        ("</em>", ""),
+        ("<span>", ""),
+        ("</span>", ""),
+    ):
+        text = text.replace(old, new)
+    return " ".join(text.split()).strip()
+
+
+def _normalize_link_for_dedupe(value: Any) -> str:
+    link = _clean_text(value)
+    if not link:
+        return ""
+
+    parsed = urlsplit(link)
+    if parsed.scheme or parsed.netloc:
+        path = parsed.path.rstrip("/")
+        return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+
+    return link.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+
+
+def _normalize_text_for_dedupe(value: Any) -> str:
+    text = _clean_text(value).casefold()
+    text = HTML_TAG_PATTERN.sub("", text)
+    text = text.replace("\u3000", " ")
+    text = NON_WORD_PATTERN.sub("", text)
+    return text
+
+
+def _series_or_default(df: pd.DataFrame, column: str | None, default: str) -> pd.Series:
+    if column is None:
+        return pd.Series([default] * len(df), index=df.index, dtype="object")
+    return df[column].map(_clean_text)
+
+
+def _normalize_news_frame(raw_df: pd.DataFrame, keyword: str) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return _empty_news_frame()
+
+    title_col = _pick_column(raw_df, TITLE_COLUMNS)
+    link_col = _pick_column(raw_df, LINK_COLUMNS)
+    source_col = _pick_column(raw_df, SOURCE_COLUMNS)
+    time_col = _pick_column(raw_df, TIME_COLUMNS)
+    content_col = _pick_column(raw_df, CONTENT_COLUMNS)
+
+    if title_col is None:
+        raise ValueError(f"AKShare 返回数据缺少标题字段，实际字段：{list(raw_df.columns)}")
+    if link_col is None:
+        raise ValueError(f"AKShare 返回数据缺少链接字段，实际字段：{list(raw_df.columns)}")
+
+    news_df = pd.DataFrame(
+        {
+            "标题": _series_or_default(raw_df, title_col, ""),
+            "来源媒体": _series_or_default(raw_df, source_col, "未知来源"),
+            "发布时间": _series_or_default(raw_df, time_col, ""),
+            "原文链接": _series_or_default(raw_df, link_col, ""),
+            "匹配关键词": keyword,
+            "新闻内容": _series_or_default(raw_df, content_col, ""),
+        }
+    )
+
+    news_df = news_df[
+        news_df["标题"].str.strip().ne("") & news_df["原文链接"].str.strip().ne("")
+    ]
+    return news_df
+
+
+def _sort_news(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    sorted_df = df.copy()
+    parsed_time = pd.to_datetime(sorted_df["发布时间"], errors="coerce")
+    sorted_df["_发布时间排序"] = parsed_time
+    sorted_df = sorted_df.sort_values(
+        by=["_发布时间排序", "发布时间"],
+        ascending=[False, False],
+        na_position="last",
+    )
+    return sorted_df.drop(columns=["_发布时间排序"]).reset_index(drop=True)
+
+
+def _is_similar_title(title: str, kept_titles: list[str]) -> bool:
+    if not title:
+        return False
+
+    for kept_title in kept_titles:
+        if not kept_title:
+            continue
+        if SequenceMatcher(None, title, kept_title).ratio() >= TITLE_SIMILARITY_THRESHOLD:
+            return True
+    return False
+
+
+def deduplicate_news(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    sorted_df = _sort_news(df)
+    kept_indices: list[int] = []
+    seen_links: set[str] = set()
+    seen_titles: set[str] = set()
+    seen_contents: set[str] = set()
+    kept_titles: list[str] = []
+
+    for index, row in sorted_df.iterrows():
+        link_key = _normalize_link_for_dedupe(row.get("原文链接", ""))
+        title_key = _normalize_text_for_dedupe(row.get("标题", ""))
+        content_key = _normalize_text_for_dedupe(row.get("新闻内容", ""))
+
+        is_duplicate = False
+        if link_key and link_key in seen_links:
+            is_duplicate = True
+        elif title_key and title_key in seen_titles:
+            is_duplicate = True
+        elif content_key and content_key in seen_contents:
+            is_duplicate = True
+        elif _is_similar_title(title_key, kept_titles):
+            is_duplicate = True
+
+        if is_duplicate:
+            continue
+
+        kept_indices.append(index)
+        if link_key:
+            seen_links.add(link_key)
+        if title_key:
+            seen_titles.add(title_key)
+            kept_titles.append(title_key)
+        if content_key:
+            seen_contents.add(content_key)
+
+    return sorted_df.loc[kept_indices].reset_index(drop=True)
+
+
+@contextmanager
+def _akshare_regex_compat():
+    if StringMethods is None:
+        yield
+        return
+
+    original_replace = StringMethods.replace
+
+    def patched_replace(
+        self,
+        pat,
+        repl,
+        n=-1,
+        case=None,
+        flags=0,
+        regex=False,
+    ):
+        if pat == r"\u3000" and regex is True:
+            return original_replace(
+                self,
+                "\u3000",
+                repl,
+                n=n,
+                case=case,
+                flags=flags,
+                regex=False,
+            )
+        return original_replace(
+            self,
+            pat,
+            repl,
+            n=n,
+            case=case,
+            flags=flags,
+            regex=regex,
+        )
+
+    with PANDAS_REPLACE_PATCH_LOCK:
+        StringMethods.replace = patched_replace
+        try:
+            yield
+        finally:
+            StringMethods.replace = original_replace
+
+
+def _fetch_from_akshare(keyword: str, timeout: int = DEFAULT_TIMEOUT) -> pd.DataFrame:
+    if ak is None:
+        raise ImportError(f"akshare 未安装：{AKSHARE_IMPORT_ERROR}")
+
+    with _akshare_regex_compat():
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(ak.stock_news_em, symbol=keyword)
+        try:
+            raw_df = future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError(f"AKShare 超过 {timeout} 秒未返回") from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    return _normalize_news_frame(raw_df, keyword)
+
+
+def _parse_jsonp(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    left = stripped.find("(")
+    right = stripped.rfind(")")
+
+    if left != -1 and right != -1 and left < right:
+        payload = stripped[left + 1 : right]
+    else:
+        json_start = stripped.find("{")
+        json_end = stripped.rfind("}")
+        if json_start == -1 or json_end == -1 or json_start > json_end:
+            raise ValueError("东方财富 fallback 返回内容不是 JSONP/JSON")
+        payload = stripped[json_start : json_end + 1]
+
+    return json.loads(payload)
+
+
+def _extract_eastmoney_items(payload: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if "title" in value:
+                items.append(value)
+                return
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    return items
+
+
+def _eastmoney_param_variants(keyword: str) -> list[dict[str, Any]]:
+    timestamp = int(time.time() * 1000)
+    callback = f"jQuery35101792940631092459_{timestamp}"
+    search_payload = {
+        "uid": "",
+        "keyword": keyword,
+        "type": ["cmsArticleWebOld"],
+        "client": "web",
+        "clientType": "web",
+        "clientVersion": "curr",
+        "param": {
+            "cmsArticleWebOld": {
+                "searchScope": "default",
+                "sort": "default",
+                "pageIndex": 1,
+                "pageSize": 10,
+                "preTag": "<em>",
+                "postTag": "</em>",
+            }
+        },
+    }
+
+    return [
+        {
+            "cb": callback,
+            "param": json.dumps(search_payload, ensure_ascii=False),
+            "_": timestamp,
+        },
+    ]
+
+
+def _normalize_eastmoney_items(
+    items: list[dict[str, Any]], keyword: str
+) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+
+    for item in items:
+        title = _clean_text(item.get("title") or item.get("新闻标题"))
+        code = _clean_text(item.get("code"))
+        link = _clean_text(
+            item.get("url")
+            or item.get("link")
+            or item.get("articleUrl")
+            or item.get("newsUrl")
+        )
+        if not link and code:
+            link = f"http://finance.eastmoney.com/a/{code}.html"
+
+        if not title or not link:
+            continue
+
+        rows.append(
+            {
+                "标题": title,
+                "来源媒体": _clean_text(
+                    item.get("mediaName") or item.get("source") or "东方财富"
+                ),
+                "发布时间": _clean_text(item.get("date") or item.get("time")),
+                "原文链接": link,
+                "匹配关键词": keyword,
+                "新闻内容": _clean_text(item.get("content") or item.get("summary")),
+            }
+        )
+
+    if not rows:
+        return _empty_news_frame()
+    return pd.DataFrame(rows, columns=[*DISPLAY_COLUMNS, "匹配关键词", "新闻内容"])
+
+
+def _fetch_from_eastmoney(keyword: str, timeout: int = DEFAULT_TIMEOUT) -> pd.DataFrame:
+    last_error: Exception | None = None
+    headers = {
+        **REQUEST_HEADERS,
+        "Referer": f"https://so.eastmoney.com/news/s?keyword={quote(keyword)}",
+    }
+
+    for params in _eastmoney_param_variants(keyword):
+        try:
+            response = requests.get(
+                EASTMONEY_SEARCH_URL,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            payload = _parse_jsonp(response.text)
+            items = _extract_eastmoney_items(payload)
+            return _normalize_eastmoney_items(items, keyword)
+        except Exception as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise RuntimeError(f"东方财富 fallback 失败：{last_error}") from last_error
+    return _empty_news_frame()
+
+
+def fetch_keyword_news(keyword: str, timeout: int = DEFAULT_TIMEOUT) -> pd.DataFrame:
+    akshare_error: Exception | None = None
+
+    try:
+        return _fetch_from_akshare(keyword, timeout=timeout)
+    except Exception as exc:
+        akshare_error = exc
+
+    try:
+        return _fetch_from_eastmoney(keyword, timeout=timeout)
+    except Exception as exc:
+        raise RuntimeError(
+            f"关键词「{keyword}」抓取失败；AKShare 错误：{akshare_error}；"
+            f"东方财富 fallback 错误：{exc}"
+        ) from exc
+
+
+def fetch_sector_news(
+    sector: str, keywords: list[str] | None = None, timeout: int = DEFAULT_TIMEOUT
+) -> SectorResult:
+    if keywords is None:
+        keywords = SECTORS[sector]
+
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+
+    for keyword in keywords:
+        try:
+            frames.append(fetch_keyword_news(keyword, timeout=timeout))
+        except Exception as exc:
+            errors.append(f"{keyword}: {exc}")
+
+    if not frames:
+        return SectorResult(
+            data=_empty_news_frame(),
+            error=f"{sector} 抓取失败；" + "；".join(errors),
+        )
+
+    combined_df = pd.concat(frames, ignore_index=True)
+    combined_df = deduplicate_news(combined_df)
+
+    if errors:
+        return SectorResult(data=combined_df, warnings=tuple(errors))
+    return SectorResult(data=combined_df)
+
+
+def build_event_metadata(
+    event_category: str,
+    event_to_sectors: dict[str, list[str]] | None = None,
+) -> dict[str, str]:
+    if event_to_sectors is None:
+        event_to_sectors = EVENT_TO_SECTORS
+
+    related_sectors = event_to_sectors.get(event_category, [])
+    if not related_sectors:
+        return {
+            "event_category": event_category,
+            "related_sectors": "未映射",
+            "reason": "影响关系不确定",
+        }
+
+    related_text = "、".join(related_sectors)
+    return {
+        "event_category": event_category,
+        "related_sectors": related_text,
+        "reason": f"根据「{event_category}」事件类别映射，可能影响：{related_text}",
+    }
+
+
+def annotate_external_event_news(
+    news_df: pd.DataFrame,
+    event_category: str,
+    event_to_sectors: dict[str, list[str]] | None = None,
+) -> pd.DataFrame:
+    if news_df is None or news_df.empty:
+        frame = _empty_news_frame()
+    else:
+        frame = news_df.copy()
+
+    metadata = build_event_metadata(event_category, event_to_sectors)
+    for column, value in metadata.items():
+        frame[column] = value
+    return frame
+
+
+def fetch_external_event_news(
+    event_category: str,
+    keywords: list[str] | None = None,
+    event_to_sectors: dict[str, list[str]] | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> SectorResult:
+    if keywords is None:
+        keywords = EXTERNAL_EVENTS[event_category]
+
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+
+    for keyword in keywords:
+        try:
+            frames.append(fetch_keyword_news(keyword, timeout=timeout))
+        except Exception as exc:
+            errors.append(f"{keyword}: {exc}")
+
+    if not frames:
+        return SectorResult(
+            data=annotate_external_event_news(
+                _empty_news_frame(),
+                event_category,
+                event_to_sectors,
+            ),
+            error=f"{event_category} 抓取失败；" + "；".join(errors),
+        )
+
+    combined_df = pd.concat(frames, ignore_index=True)
+    combined_df = deduplicate_news(combined_df)
+    combined_df = annotate_external_event_news(
+        combined_df,
+        event_category,
+        event_to_sectors,
+    )
+
+    if errors:
+        return SectorResult(data=combined_df, warnings=tuple(errors))
+    return SectorResult(data=combined_df)
+
+
+def fetch_all_sectors() -> dict[str, SectorResult]:
+    results: dict[str, SectorResult] = {}
+    for sector, keywords in SECTORS.items():
+        results[sector] = fetch_sector_news(sector, keywords)
+    return results
+
+
+def fetch_all_external_events(
+    external_events: dict[str, list[str]] | None = None,
+    event_to_sectors: dict[str, list[str]] | None = None,
+) -> dict[str, SectorResult]:
+    if external_events is None:
+        external_events = EXTERNAL_EVENTS
+
+    results: dict[str, SectorResult] = {}
+    for event_category, keywords in external_events.items():
+        results[event_category] = fetch_external_event_news(
+            event_category,
+            keywords,
+            event_to_sectors=event_to_sectors,
+        )
+    return results
+
+
+def result_to_dict(result: SectorResult) -> dict[str, Any]:
+    return {
+        "data": result.data,
+        "error": result.error,
+        "warnings": list(result.warnings),
+    }
