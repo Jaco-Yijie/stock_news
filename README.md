@@ -1,3 +1,23 @@
+## Quick Start / How to use
+
+### 1. Download project
+
+```bash
+git clone https://github.com/wangyijie072022-cloud/stock_news.git
+cd stock_news
+
+### 2. Create a Python virtual environment
+macOS / Linux:
+python3 -m venv .venv
+source .venv/bin/activate
+
+Windows:
+python -m venv .venv
+.venv\Scripts\activate
+
+### 3. Install dependencies
+pip install -r requirements.txt
+
 # stock_news
 
 A Streamlit dashboard for collecting, caching, filtering, and deduplicating A-share sector news.
