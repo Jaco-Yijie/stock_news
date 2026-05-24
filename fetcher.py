@@ -28,6 +28,15 @@ except ImportError as exc:
 else:
     AKSHARE_IMPORT_ERROR = None
 
+from classifier import (
+    LLMValidationCache,
+    LLMVerifier,
+    classify_news_item,
+    extract_rule_keywords,
+    normalize_event_rules,
+    validate_classification_with_llm,
+)
+from config_store import extract_sector_keywords, extract_sector_rule_id
 from sectors import EVENT_TO_SECTORS, EXTERNAL_EVENTS, SECTORS
 
 
@@ -51,7 +60,34 @@ REQUEST_HEADERS = {
 PANDAS_REPLACE_PATCH_LOCK = Lock()
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 NON_WORD_PATTERN = re.compile(r"[\W_]+", re.UNICODE)
-TITLE_SIMILARITY_THRESHOLD = 0.94
+TITLE_MARKET_MOVE_PATTERN = re.compile(
+    r"(?:上涨|下跌|涨近|涨超|涨逾|跌近|跌超|跌逾|大涨|大跌|拉升|跳水|走强|走弱|涨|跌)"
+    r"\s*[+-]?\d+(?:\.\d+)?\s*(?:%|％|个百分点|点)?"
+)
+TITLE_PERCENT_PATTERN = re.compile(r"[+-]?\d+(?:\.\d+)?\s*(?:%|％|个百分点)")
+TITLE_NOISE_WORDS = (
+    "最新",
+    "突发",
+    "快讯",
+    "午评",
+    "盘中",
+    "异动",
+    "拉升",
+    "走强",
+    "跳水",
+)
+TITLE_SIMILARITY_THRESHOLD = 0.88
+DEFAULT_LLM_VALIDATION_CACHE = LLMValidationCache()
+VISION_PRO_SECTOR_RULES = [
+    {
+        "positiveKeywords": ["Vision Pro"],
+        "requiredCoKeywords": [],
+        "negativeKeywords": [],
+        "weight": 2,
+        "minScore": 2,
+        "fields": ["title", "summary", "content"],
+    }
+]
 
 
 @dataclass(frozen=True)
@@ -111,6 +147,17 @@ def _normalize_text_for_dedupe(value: Any) -> str:
     text = text.replace("\u3000", " ")
     text = NON_WORD_PATTERN.sub("", text)
     return text
+
+
+def _normalize_title_for_dedupe(value: Any) -> str:
+    text = _clean_text(value).casefold()
+    text = HTML_TAG_PATTERN.sub("", text)
+    text = TITLE_MARKET_MOVE_PATTERN.sub("", text)
+    text = TITLE_PERCENT_PATTERN.sub("", text)
+    for noise_word in TITLE_NOISE_WORDS:
+        text = text.replace(noise_word, "")
+    text = text.replace("\u3000", " ")
+    return NON_WORD_PATTERN.sub("", text)
 
 
 def _series_or_default(df: pd.DataFrame, column: str | None, default: str) -> pd.Series:
@@ -191,7 +238,7 @@ def deduplicate_news(df: pd.DataFrame) -> pd.DataFrame:
 
     for index, row in sorted_df.iterrows():
         link_key = _normalize_link_for_dedupe(row.get("原文链接", ""))
-        title_key = _normalize_text_for_dedupe(row.get("标题", ""))
+        title_key = _normalize_title_for_dedupe(row.get("标题", ""))
         content_key = _normalize_text_for_dedupe(row.get("新闻内容", ""))
 
         is_duplicate = False
@@ -430,16 +477,50 @@ def fetch_keyword_news(keyword: str, timeout: int = DEFAULT_TIMEOUT) -> pd.DataF
         ) from exc
 
 
+def _rules_for_sector_rule_id(rule_id: str) -> list[Any]:
+    normalized = str(rule_id or "").strip().casefold().replace(" ", "").replace("／", "/")
+    if normalized in {"visionpro", "vision_pro", "vision-pro"}:
+        return VISION_PRO_SECTOR_RULES
+    if normalized in {"苹果产业链", "apple_supply_chain", "apple-supply-chain"}:
+        return EXTERNAL_EVENTS.get("苹果产业链", [])
+    if normalized in {"美联储/利率", "美联储利率", "fed_rate", "fed-rate", "fed/rate"}:
+        return EXTERNAL_EVENTS.get("美联储/利率", [])
+    return []
+
+
+def high_risk_sector_rules(sector: str, sector_config: Any = None) -> list[Any]:
+    rule_id = extract_sector_rule_id(sector_config)
+    if rule_id:
+        return _rules_for_sector_rule_id(rule_id)
+
+    normalized = str(sector or "").strip().casefold().replace(" ", "").replace("／", "/")
+    if normalized == "visionpro":
+        return VISION_PRO_SECTOR_RULES
+    if normalized == "苹果产业链":
+        return EXTERNAL_EVENTS.get("苹果产业链", [])
+    if normalized in {"美联储/利率", "美联储利率"}:
+        return EXTERNAL_EVENTS.get("美联储/利率", [])
+    return []
+
+
 def fetch_sector_news(
-    sector: str, keywords: list[str] | None = None, timeout: int = DEFAULT_TIMEOUT
+    sector: str,
+    keywords: Any = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    llm_verifier: LLMVerifier | None = None,
+    llm_cache: LLMValidationCache | None = None,
 ) -> SectorResult:
     if keywords is None:
         keywords = SECTORS[sector]
+    if llm_verifier is not None and llm_cache is None:
+        llm_cache = DEFAULT_LLM_VALIDATION_CACHE
+    sector_config = keywords
+    query_keywords = extract_sector_keywords(sector_config)
 
     frames: list[pd.DataFrame] = []
     errors: list[str] = []
 
-    for keyword in keywords:
+    for keyword in query_keywords:
         try:
             frames.append(fetch_keyword_news(keyword, timeout=timeout))
         except Exception as exc:
@@ -453,6 +534,15 @@ def fetch_sector_news(
 
     combined_df = pd.concat(frames, ignore_index=True)
     combined_df = deduplicate_news(combined_df)
+    sector_rules = high_risk_sector_rules(sector, sector_config)
+    if sector_rules:
+        combined_df = filter_external_event_news(
+            combined_df,
+            sector,
+            sector_rules,
+            llm_verifier=llm_verifier,
+            llm_cache=llm_cache,
+        )
 
     if errors:
         return SectorResult(data=combined_df, warnings=tuple(errors))
@@ -498,19 +588,61 @@ def annotate_external_event_news(
     return frame
 
 
+def filter_external_event_news(
+    news_df: pd.DataFrame,
+    event_category: str,
+    event_rules: list[Any],
+    llm_verifier: LLMVerifier | None = None,
+    llm_cache: LLMValidationCache | None = None,
+) -> pd.DataFrame:
+    if news_df is None or news_df.empty:
+        return _empty_news_frame()
+
+    kept_rows: list[pd.Series] = []
+    for _, row in news_df.iterrows():
+        news = row.to_dict()
+        classification = classify_news_item(news, event_category, event_rules)
+        if not classification.matched:
+            continue
+
+        validation = validate_classification_with_llm(
+            news,
+            event_category,
+            classification,
+            verifier=llm_verifier,
+            cache=llm_cache,
+        )
+        if not validation.should_keep:
+            continue
+        if validation.category and validation.category != event_category:
+            continue
+
+        kept_rows.append(row)
+
+    if not kept_rows:
+        return _empty_news_frame()
+    return pd.DataFrame(kept_rows, columns=news_df.columns).reset_index(drop=True)
+
+
 def fetch_external_event_news(
     event_category: str,
-    keywords: list[str] | None = None,
+    keywords: list[Any] | None = None,
     event_to_sectors: dict[str, list[str]] | None = None,
     timeout: int = DEFAULT_TIMEOUT,
+    llm_verifier: LLMVerifier | None = None,
+    llm_cache: LLMValidationCache | None = None,
 ) -> SectorResult:
     if keywords is None:
         keywords = EXTERNAL_EVENTS[event_category]
+    if llm_verifier is not None and llm_cache is None:
+        llm_cache = DEFAULT_LLM_VALIDATION_CACHE
+    event_rules = normalize_event_rules({event_category: keywords}).get(event_category, [])
+    query_keywords = extract_rule_keywords(event_rules)
 
     frames: list[pd.DataFrame] = []
     errors: list[str] = []
 
-    for keyword in keywords:
+    for keyword in query_keywords:
         try:
             frames.append(fetch_keyword_news(keyword, timeout=timeout))
         except Exception as exc:
@@ -528,6 +660,13 @@ def fetch_external_event_news(
 
     combined_df = pd.concat(frames, ignore_index=True)
     combined_df = deduplicate_news(combined_df)
+    combined_df = filter_external_event_news(
+        combined_df,
+        event_category,
+        event_rules,
+        llm_verifier=llm_verifier,
+        llm_cache=llm_cache,
+    )
     combined_df = annotate_external_event_news(
         combined_df,
         event_category,
@@ -547,7 +686,7 @@ def fetch_all_sectors() -> dict[str, SectorResult]:
 
 
 def fetch_all_external_events(
-    external_events: dict[str, list[str]] | None = None,
+    external_events: dict[str, list[Any]] | None = None,
     event_to_sectors: dict[str, list[str]] | None = None,
 ) -> dict[str, SectorResult]:
     if external_events is None:

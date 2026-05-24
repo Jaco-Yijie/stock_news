@@ -1,17 +1,17 @@
 from datetime import datetime
 from html import escape
-from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+from classifier import LLMVerifier, extract_rule_keywords
 from config_store import (
-    EVENTS_CONFIG_PATH,
-    SECTORS_CONFIG_PATH,
     add_event_category,
     add_event_keyword,
     add_keyword,
     add_sector,
+    extract_sector_keywords,
     remove_event_category,
     remove_event_keyword,
     remove_keyword,
@@ -22,9 +22,14 @@ from config_store import (
     try_load_sectors_config,
     update_event_related_sectors,
 )
-from fetcher import SectorResult, fetch_external_event_news, fetch_sector_news
+from fetcher import (
+    SectorResult,
+    deduplicate_news,
+    fetch_external_event_news,
+    fetch_sector_news,
+)
+from llm_provider import load_llm_verifier_from_env
 from news_store import (
-    CACHE_PATH,
     cache_metadata,
     cache_to_display,
     clear_cache,
@@ -34,13 +39,46 @@ from news_store import (
     filter_incremental_news,
     merge_cache,
     read_cache,
+    refilter_external_event_cache,
     save_cache,
 )
 from sectors import SECTORS as DEFAULT_SECTORS
 
 
-st.set_page_config(page_title="A股板块新闻收集系统", layout="wide")
+st.set_page_config(page_title="A股板块新闻", page_icon="📰", layout="wide")
 DEFAULT_SELECTED_SECTORS = ("半导体芯片",)
+TIME_RANGE_OPTIONS = ("全部", "今天", "近 3 天", "本周")
+SECTOR_GROUPS: dict[str, tuple[str, ...]] = {
+    "科技": (
+        "半导体芯片",
+        "人工智能",
+        "算力数据中心",
+        "信创软件",
+        "网络安全",
+        "消费电子",
+        "量子计算",
+    ),
+    "新兴产业": ("商业航天", "低空经济", "机器人", "脑机接口"),
+    "新能源": ("新能源汽车", "光伏", "风电", "储能", "电力设备"),
+    "医药": ("创新药", "医药医疗", "CXO"),
+    "消费": ("白酒消费", "家电", "旅游酒店", "传媒游戏"),
+    "金融地产": ("银行", "证券", "保险", "房地产"),
+    "周期资源": (
+        "有色金属",
+        "黄金",
+        "煤炭",
+        "钢铁",
+        "化工",
+        "农业",
+        "航运港口",
+        "物流快递",
+        "环保水务",
+    ),
+}
+
+
+def get_llm_verifier() -> tuple[LLMVerifier | None, str | None]:
+    return load_llm_verifier_from_env()
 
 
 def inject_styles() -> None:
@@ -210,13 +248,6 @@ def inject_styles() -> None:
             margin-top: 0.35rem;
             color: var(--muted);
             font-size: 0.95rem;
-        }
-
-        .run-path {
-            margin-top: 0.45rem;
-            color: var(--muted-soft);
-            font-size: 0.78rem;
-            overflow-wrap: anywhere;
         }
 
         .metric-grid {
@@ -497,7 +528,8 @@ def parse_keyword_input(value: str) -> list[str]:
 
 def fetch_selected_sector_cache(
     selected_sectors: list[str],
-    sectors_config: dict[str, list[str]],
+    sectors_config: dict[str, Any],
+    llm_verifier: LLMVerifier | None = None,
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     fetched_frames: list[pd.DataFrame] = []
     warnings_by_sector: dict[str, list[str]] = {}
@@ -506,7 +538,11 @@ def fetch_selected_sector_cache(
     for sector in selected_sectors:
         sector_warnings: list[str] = []
         try:
-            result = fetch_sector_news(sector, sectors_config[sector])
+            result = fetch_sector_news(
+                sector,
+                sectors_config[sector],
+                llm_verifier=llm_verifier,
+            )
         except Exception as exc:
             warnings_by_sector[sector] = [f"{sector} 抓取失败：{exc}"]
             continue
@@ -525,8 +561,9 @@ def fetch_selected_sector_cache(
 
 
 def fetch_external_event_cache(
-    external_events: dict[str, list[str]],
+    external_events: dict[str, list[Any]],
     event_to_sectors: dict[str, list[str]],
+    llm_verifier: LLMVerifier | None = None,
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     fetched_frames: list[pd.DataFrame] = []
     warnings_by_event: dict[str, list[str]] = {}
@@ -539,6 +576,7 @@ def fetch_external_event_cache(
                 event_category,
                 keywords,
                 event_to_sectors=event_to_sectors,
+                llm_verifier=llm_verifier,
             )
         except Exception as exc:
             warnings_by_event[event_category] = [f"{event_category} 抓取失败：{exc}"]
@@ -566,9 +604,10 @@ def fetch_external_event_cache(
 
 def fetch_refresh_cache(
     selected_sectors: list[str],
-    sectors_config: dict[str, list[str]],
-    external_events: dict[str, list[str]],
+    sectors_config: dict[str, Any],
+    external_events: dict[str, list[Any]],
     event_to_sectors: dict[str, list[str]],
+    llm_verifier: LLMVerifier | None = None,
 ) -> tuple[pd.DataFrame, dict[str, list[str]], dict[str, list[str]]]:
     fetched_frames: list[pd.DataFrame] = []
     sector_warnings: dict[str, list[str]] = {}
@@ -577,6 +616,7 @@ def fetch_refresh_cache(
         sector_cache, sector_warnings = fetch_selected_sector_cache(
             selected_sectors,
             sectors_config,
+            llm_verifier=llm_verifier,
         )
         if not sector_cache.empty:
             fetched_frames.append(sector_cache)
@@ -584,6 +624,7 @@ def fetch_refresh_cache(
     external_cache, external_warnings = fetch_external_event_cache(
         external_events,
         event_to_sectors,
+        llm_verifier=llm_verifier,
     )
     if not external_cache.empty:
         fetched_frames.append(external_cache)
@@ -597,6 +638,122 @@ def collect_sources(news_df: pd.DataFrame) -> list[str]:
         return []
     sources.update(source for source in news_df["来源媒体"].dropna().astype(str) if source)
     return sorted(sources)
+
+
+def filter_news_by_time(news_df: pd.DataFrame, time_range: str) -> pd.DataFrame:
+    if news_df.empty or time_range == "全部":
+        return news_df.reset_index(drop=True)
+    if "发布时间" not in news_df.columns:
+        return news_df.iloc[0:0].reset_index(drop=True)
+
+    publish_times = pd.to_datetime(news_df["发布时间"], errors="coerce")
+    now = pd.Timestamp.now()
+    if time_range == "今天":
+        start_at = now.normalize()
+    elif time_range == "近 3 天":
+        start_at = now - pd.Timedelta(days=3)
+    elif time_range == "本周":
+        start_at = now.normalize() - pd.Timedelta(days=now.weekday())
+    else:
+        return news_df.reset_index(drop=True)
+
+    try:
+        keep_mask = publish_times.ge(start_at)
+    except TypeError:
+        publish_times = pd.to_datetime(
+            news_df["发布时间"],
+            errors="coerce",
+            utc=True,
+        ).dt.tz_convert(None)
+        keep_mask = publish_times.ge(start_at)
+
+    return news_df[keep_mask.fillna(False)].reset_index(drop=True)
+
+
+def deduplicate_display_news(
+    news_df: pd.DataFrame,
+    group_column: str | None = None,
+) -> pd.DataFrame:
+    if news_df.empty:
+        return news_df.reset_index(drop=True)
+    if not group_column or group_column not in news_df.columns:
+        return deduplicate_news(news_df).reset_index(drop=True)
+
+    deduped_frames = [
+        deduplicate_news(group_df)
+        for _, group_df in news_df.groupby(group_column, sort=False)
+    ]
+    if not deduped_frames:
+        return news_df.iloc[0:0].reset_index(drop=True)
+    return pd.concat(deduped_frames, ignore_index=True).reset_index(drop=True)
+
+
+def grouped_sectors(sectors_config: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    grouped: list[tuple[str, list[str]]] = []
+    assigned_sectors: set[str] = set()
+
+    for group_name, sector_names in SECTOR_GROUPS.items():
+        sectors = [sector for sector in sector_names if sector in sectors_config]
+        if sectors:
+            grouped.append((group_name, sectors))
+            assigned_sectors.update(sectors)
+
+    remaining_sectors = [sector for sector in sectors_config if sector not in assigned_sectors]
+    if remaining_sectors:
+        grouped.append(("其他", remaining_sectors))
+
+    return grouped
+
+
+def sector_matches_query(sector: str, sector_keywords: Any, query: str) -> bool:
+    if not query:
+        return True
+    return query in sector.casefold() or any(
+        query in item.casefold() for item in extract_sector_keywords(sector_keywords)
+    )
+
+
+def render_sector_selector(sectors_config: dict[str, Any], sector_query: str) -> list[str]:
+    normalized_query = sector_query.strip().casefold()
+    visible_sectors = [
+        sector
+        for sector, sector_keywords in sectors_config.items()
+        if sector_matches_query(sector, sector_keywords, normalized_query)
+    ]
+    selected_count = sum(
+        1
+        for sector in sectors_config
+        if st.session_state.get(f"sector_selected::{sector}", False)
+    )
+    st.sidebar.caption(
+        f"板块选择：已选 {selected_count} · 可见 {len(visible_sectors)} · 共 {len(sectors_config)}"
+    )
+
+    visible_set = set(visible_sectors)
+    has_visible_group = False
+    for group_name, sectors in grouped_sectors(sectors_config):
+        visible_group_sectors = [sector for sector in sectors if sector in visible_set]
+        if not visible_group_sectors:
+            continue
+
+        has_visible_group = True
+        selected_in_group = sum(
+            1
+            for sector in sectors
+            if st.session_state.get(f"sector_selected::{sector}", False)
+        )
+        expanded = bool(normalized_query) or selected_in_group > 0
+        with st.sidebar.expander(
+            f"{group_name}（{selected_in_group}/{len(sectors)}）",
+            expanded=expanded,
+        ):
+            for sector in visible_group_sectors:
+                st.checkbox(sector, key=f"sector_selected::{sector}")
+
+    if not has_visible_group:
+        st.sidebar.caption("没有匹配的板块。")
+
+    return visible_sectors
 
 
 def filter_news(news_df: pd.DataFrame, keyword: str, selected_sources: list[str]) -> pd.DataFrame:
@@ -655,7 +812,6 @@ def render_external_event_item(row: pd.Series) -> str:
     keyword = escape(str(row.get("匹配关键词", "")))
     event_category = escape(str(row.get("event_category", "")))
     related_sectors = escape(str(row.get("related_sectors", "") or "未映射"))
-    reason = escape(str(row.get("reason", "") or "不确定"))
     link = escape(str(row.get("原文链接", "")), quote=True)
 
     return f"""
@@ -667,7 +823,6 @@ def render_external_event_item(row: pd.Series) -> str:
                 <span class="keyword-tag">{event_category}</span>
                 <span class="keyword-tag">{keyword}</span>
                 <span>可能影响板块：{related_sectors}</span>
-                <span>判断依据：{reason}</span>
                 <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">打开原文</a>
             </div>
         </article>
@@ -776,14 +931,12 @@ def render_dashboard_header(
     latest_cache_at: str,
     added_count: int,
 ) -> None:
-    run_path = escape(str(Path(__file__).resolve()))
     st.markdown(
         f"""
         <section class="dashboard-header">
             <div>
                 <div class="dashboard-title">A股板块新闻</div>
                 <div class="dashboard-subtitle">按板块聚合东方财富新闻，支持筛选与去重</div>
-                <div class="run-path">运行文件：{run_path}</div>
             </div>
             <div class="metric-grid">
                 <div class="metric-card">
@@ -823,16 +976,15 @@ def show_config_notice() -> None:
         st.sidebar.success(notice)
 
 
-def render_sector_config_manager(sectors_config: dict[str, list[str]]) -> None:
+def render_sector_config_manager(sectors_config: dict[str, Any]) -> None:
     with st.sidebar.expander("关键词管理", expanded=False):
-        st.caption(f"配置文件：{SECTORS_CONFIG_PATH}")
         sector_options = list(sectors_config)
         if not sector_options:
             st.info("暂无板块配置。")
             return
 
         selected_sector = st.selectbox("选择板块", sector_options, key="sector_config_select")
-        keywords = sectors_config.get(selected_sector, [])
+        keywords = extract_sector_keywords(sectors_config.get(selected_sector, []))
         st.caption("当前关键词：" + ("、".join(keywords) if keywords else "无"))
 
         new_keyword = st.text_input("新增关键词", key="new_sector_keyword")
@@ -907,18 +1059,17 @@ def render_sector_config_manager(sectors_config: dict[str, list[str]]) -> None:
 
 
 def render_event_config_manager(
-    external_events: dict[str, list[str]],
+    external_events: dict[str, list[Any]],
     event_to_sectors: dict[str, list[str]],
-    sectors_config: dict[str, list[str]],
+    sectors_config: dict[str, Any],
 ) -> None:
     with st.sidebar.expander("外部事件管理", expanded=False):
-        st.caption(f"配置文件：{EVENTS_CONFIG_PATH}")
         event_options = list(external_events)
         if not event_options:
             st.info("暂无外部事件配置。")
         else:
             selected_event = st.selectbox("选择事件类别", event_options, key="event_config_select")
-            event_keywords = external_events.get(selected_event, [])
+            event_keywords = extract_rule_keywords(external_events.get(selected_event, []))
             related_sectors = event_to_sectors.get(selected_event, [])
             st.caption("当前事件关键词：" + ("、".join(event_keywords) if event_keywords else "无"))
             st.caption("当前影响板块：" + ("、".join(related_sectors) if related_sectors else "未映射"))
@@ -1015,6 +1166,7 @@ def main() -> None:
     events_config, events_config_error = try_load_events_config()
     external_events = events_config["external_events"]
     event_to_sectors = events_config["event_to_sectors"]
+    llm_verifier, llm_notice = get_llm_verifier()
 
     for sector in sectors_config:
         st.session_state.setdefault(
@@ -1038,26 +1190,7 @@ def main() -> None:
         for sector in sectors_config:
             st.session_state[f"sector_selected::{sector}"] = False
 
-    normalized_sector_query = sector_query.strip().casefold()
-    visible_sectors = [
-        sector
-        for sector, sector_keywords in sectors_config.items()
-        if not normalized_sector_query
-        or normalized_sector_query in sector.casefold()
-        or any(normalized_sector_query in item.casefold() for item in sector_keywords)
-    ]
-
-    selected_count_preview = sum(
-        1
-        for sector in sectors_config
-        if st.session_state.get(f"sector_selected::{sector}", False)
-    )
-    st.sidebar.caption(
-        f"板块选择：已选 {selected_count_preview} · 可见 {len(visible_sectors)} · 共 {len(sectors_config)}"
-    )
-    with st.sidebar.container(height=320):
-        for sector in visible_sectors:
-            st.checkbox(sector, key=f"sector_selected::{sector}")
+    render_sector_selector(sectors_config, sector_query)
 
     selected_sectors = [
         sector
@@ -1070,6 +1203,9 @@ def main() -> None:
     )
     show_sector_news = display_scope in ("全部", "板块新闻")
     show_external_events = display_scope in ("全部", "外部事件")
+    time_range = st.sidebar.radio("时间范围", options=TIME_RANGE_OPTIONS)
+    if llm_notice:
+        st.sidebar.warning(llm_notice)
     keyword = st.sidebar.text_input("关键词搜索", placeholder="标题、命中关键词、来源媒体")
     max_items = st.sidebar.slider("每个板块最多展示条数", min_value=5, max_value=100, value=30)
 
@@ -1083,14 +1219,31 @@ def main() -> None:
         if selected_sectors or show_external_events:
             with st.spinner("正在增量抓取新新闻，并合并到本地缓存..."):
                 existing_result = read_cache()
+                existing_cache, cache_refilter_warnings = refilter_external_event_cache(
+                    existing_result.data,
+                    external_events,
+                    sectors_config=sectors_config,
+                    llm_verifier=llm_verifier,
+                )
                 fetched_cache, warnings_by_sector, warnings_by_event = fetch_refresh_cache(
                     selected_sectors,
                     sectors_config,
                     external_events,
                     event_to_sectors,
+                    llm_verifier=llm_verifier,
                 )
-                incremental_cache = filter_incremental_news(existing_result.data, fetched_cache)
-                merged_cache, added_count = merge_cache(existing_result.data, incremental_cache)
+                incremental_cache = filter_incremental_news(existing_cache, fetched_cache)
+                merged_cache, _ = merge_cache(existing_cache, incremental_cache)
+                merged_cache, merge_refilter_warnings = refilter_external_event_cache(
+                    merged_cache,
+                    external_events,
+                    sectors_config=sectors_config,
+                    llm_verifier=llm_verifier,
+                )
+                added_count = max(len(merged_cache) - len(existing_cache), 0)
+                cache_warnings = [*cache_refilter_warnings, *merge_refilter_warnings]
+                if cache_warnings:
+                    warnings_by_event.setdefault("缓存重过滤", []).extend(cache_warnings)
                 save_cache(merged_cache)
                 st.session_state.last_added_count = added_count
                 st.session_state.last_sector_warnings = warnings_by_sector
@@ -1108,6 +1261,7 @@ def main() -> None:
                     sectors_config,
                     external_events,
                     event_to_sectors,
+                    llm_verifier=llm_verifier,
                 )
                 if fetched_cache.empty and (warnings_by_sector or warnings_by_event):
                     st.session_state.last_added_count = 0
@@ -1116,6 +1270,16 @@ def main() -> None:
                     st.warning("全量刷新未获取到有效数据，已保留原本地缓存。")
                 else:
                     rebuilt_cache = deduplicate_cache(fetched_cache)
+                    rebuilt_cache, cache_refilter_warnings = refilter_external_event_cache(
+                        rebuilt_cache,
+                        external_events,
+                        sectors_config=sectors_config,
+                        llm_verifier=llm_verifier,
+                    )
+                    if cache_refilter_warnings:
+                        warnings_by_event.setdefault("缓存重过滤", []).extend(
+                            cache_refilter_warnings
+                        )
                     save_cache(rebuilt_cache)
                     st.session_state.last_added_count = len(rebuilt_cache)
                     st.session_state.last_sector_warnings = warnings_by_sector
@@ -1144,14 +1308,28 @@ def main() -> None:
     cache_df, cache_error = load_cached_news(st.session_state.cache_version)
     if cache_error:
         st.warning(cache_error + "。页面将显示空缓存，可点击全量刷新重建。")
+    cache_df, cache_refilter_warnings = refilter_external_event_cache(
+        cache_df,
+        external_events,
+        sectors_config=sectors_config,
+        llm_verifier=llm_verifier,
+    )
+    if cache_refilter_warnings:
+        st.warning("；".join(cache_refilter_warnings))
 
-    cache_display_df = cache_to_display(cache_df)
+    raw_cache_display_df = cache_to_display(cache_df)
+    cache_display_df = filter_news_by_time(raw_cache_display_df, time_range)
     sector_cache_display_df = cache_display_df[
         cache_display_df["news_type"].ne("external_event")
     ].reset_index(drop=True)
     external_display_df = cache_display_df[
         cache_display_df["news_type"].eq("external_event")
     ].reset_index(drop=True)
+    sector_cache_display_df = deduplicate_display_news(
+        sector_cache_display_df,
+        group_column="sector",
+    )
+    external_display_df = deduplicate_display_news(external_display_df)
     selected_cache_display_df = sector_cache_display_df[
         sector_cache_display_df["sector"].isin(selected_sectors)
     ].reset_index(drop=True)
@@ -1189,17 +1367,21 @@ def main() -> None:
         displayed_total += min(len(filtered_external_df), max_items)
 
     metadata = cache_metadata(cache_df)
+    latest_cache_at = str(metadata["latest_fetched_at"])
     render_dashboard_header(
         selected_count=len(selected_sectors),
         displayed_total=displayed_total,
         cache_total=int(metadata["total"]),
-        latest_cache_at=str(metadata["latest_fetched_at"]),
+        latest_cache_at=latest_cache_at,
         added_count=int(st.session_state.last_added_count),
     )
 
-    st.caption(f"本地缓存文件：{CACHE_PATH}")
-    if cache_display_df.empty:
+    st.caption("本地缓存已启用")
+    st.caption(f"缓存更新时间：{latest_cache_at}")
+    if raw_cache_display_df.empty:
         st.info("本地缓存暂无新闻。点击左侧“增量刷新”进行首次抓取，或点击“全量刷新”重建缓存。")
+    elif cache_display_df.empty:
+        st.info("当前时间范围下暂无新闻。")
 
     if show_external_events:
         show_external_events_section(
