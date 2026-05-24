@@ -1,39 +1,171 @@
 {
   "external_events": {
     "苹果产业链": [
-      "Apple",
-      "苹果订单",
-      "iPhone",
-      "Vision Pro",
-      "苹果供应链"
+      {
+        "positiveKeywords": [
+          "苹果订单",
+          "iPhone",
+          "苹果供应链",
+          "Apple 供应链"
+        ],
+        "requiredCoKeywords": [],
+        "negativeKeywords": [
+          "海马汽车"
+        ],
+        "weight": 2,
+        "minScore": 2,
+        "fields": [
+          "title",
+          "summary",
+          "content"
+        ]
+      },
+      {
+        "positiveKeywords": [
+          "Apple"
+        ],
+        "requiredCoKeywords": [
+          "iPhone",
+          "Vision Pro",
+          "苹果供应链",
+          "Apple 供应链",
+          "产业链",
+          "供应链"
+        ],
+        "negativeKeywords": [
+          "海马汽车"
+        ],
+        "weight": 1,
+        "minScore": 1,
+        "fields": [
+          "title",
+          "summary",
+          "content"
+        ]
+      },
+      {
+        "positiveKeywords": [
+          "Vision Pro"
+        ],
+        "requiredCoKeywords": [],
+        "negativeKeywords": [
+          "海马汽车"
+        ],
+        "weight": 2,
+        "minScore": 2,
+        "fields": [
+          "title",
+          "summary",
+          "content"
+        ]
+      }
     ],
     "AI产业链": [
-      "NVIDIA",
-      "英伟达",
-      "GPU",
-      "AI服务器",
-      "HBM"
+      {
+        "positiveKeywords": [
+          "NVIDIA",
+          "英伟达",
+          "GPU",
+          "AI服务器",
+          "HBM"
+        ],
+        "requiredCoKeywords": [],
+        "negativeKeywords": [],
+        "weight": 1,
+        "minScore": 1,
+        "fields": [
+          "title",
+          "summary",
+          "content"
+        ]
+      }
     ],
     "中美关系/制裁": [
-      "美国制裁",
-      "出口管制",
-      "关税",
-      "中美关系",
-      "美国总统"
+      {
+        "positiveKeywords": [
+          "美国制裁",
+          "出口管制",
+          "关税",
+          "中美关系",
+          "美国总统"
+        ],
+        "requiredCoKeywords": [],
+        "negativeKeywords": [],
+        "weight": 1,
+        "minScore": 1,
+        "fields": [
+          "title",
+          "summary",
+          "content"
+        ]
+      }
     ],
     "美联储/利率": [
-      "美联储",
-      "降息",
-      "加息",
-      "美元",
-      "美债收益率"
+      {
+        "positiveKeywords": [
+          "美联储",
+          "FOMC",
+          "降息",
+          "加息",
+          "鲍威尔",
+          "美债收益率"
+        ],
+        "requiredCoKeywords": [],
+        "negativeKeywords": [],
+        "weight": 2,
+        "minScore": 2,
+        "fields": [
+          "title",
+          "summary",
+          "content"
+        ]
+      },
+      {
+        "positiveKeywords": [
+          "美元"
+        ],
+        "requiredCoKeywords": [
+          "美联储",
+          "FOMC",
+          "利率",
+          "降息",
+          "加息",
+          "鲍威尔"
+        ],
+        "negativeKeywords": [
+          "中美元首",
+          "中美关系",
+          "卢比兑美元",
+          "兑美元"
+        ],
+        "weight": 1,
+        "minScore": 1,
+        "fields": [
+          "title",
+          "summary",
+          "content"
+        ]
+      }
     ],
     "油价能源": [
-      "油价",
-      "原油",
-      "OPEC",
-      "布伦特原油",
-      "WTI"
+      {
+        "positiveKeywords": [
+          "油价",
+          "原油",
+          "OPEC",
+          "布伦特原油",
+          "WTI"
+        ],
+        "requiredCoKeywords": [],
+        "negativeKeywords": [],
+        "weight": 1,
+        "minScore": 1,
+        "fields": [
+          "title",
+          "summary",
+          "content"
+        ]
+      }
     ]
   },
   "event_to_sectors": {

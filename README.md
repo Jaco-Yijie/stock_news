@@ -16,7 +16,7 @@ cd stock_news
 如果不会用 Git，也可以在 GitHub 页面点击：
 
 ```text
-Code → Download ZIP
+Code -> Download ZIP
 ```
 
 下载后解压，再进入项目文件夹。
@@ -62,13 +62,31 @@ http://localhost:8501
 - Support incremental refresh to avoid repeated full crawling
 - Save news cache locally
 - Deduplicate repeated news from different links or sources
-- Filter by sector, keyword, source, and news type
+- Filter by sector, keyword, source, news type, and time range
 - Edit sector keywords from the web interface
 - Add or remove custom sectors
 - Track external events such as Apple orders, NVIDIA GPU, US sanctions, Fed rate decisions, and oil price changes
 - Map external events to related A-share sectors
+- Optionally use LLM verification through environment variables
 - Streamlit-based web dashboard
 - Deployment-ready with configurable `DATA_DIR`
+
+## Streamlit Community Cloud Deployment
+
+推荐优先使用 Streamlit Community Cloud。
+
+创建应用时填写：
+
+- Repository：`stock_news`
+- Branch：`main`
+- Main file path：`main.py`
+- Start Command：不需要填写，Streamlit Cloud 会自动根据 `main.py` 启动
+
+注意事项：
+
+- Streamlit Community Cloud 12 小时无访问会休眠。
+- Streamlit Cloud 上的本地 `./data` 文件不适合长期线上持久化；应用重建、重启或环境变化时，缓存和在线编辑的配置可能丢失。
+- 长期保存新闻缓存和配置，建议后续接 Supabase 或 Neon。
 
 ## Project Structure
 
@@ -106,9 +124,9 @@ Sector news is collected by matching sector keywords.
 Example:
 
 ```text
-半导体芯片 → 半导体、芯片、集成电路、晶圆
-新能源汽车 → 新能源汽车、电动车、锂电池、充电桩
-人工智能 → 人工智能、大模型、AI芯片、算力
+半导体芯片 -> 半导体、芯片、集成电路、晶圆
+新能源汽车 -> 新能源汽车、电动车、锂电池、充电桩
+人工智能 -> 人工智能、大模型、AI芯片、算力
 ```
 
 ### External Events
@@ -118,11 +136,11 @@ External events are news that may indirectly affect A-share sectors.
 Examples:
 
 ```text
-Apple orders → 消费电子、半导体芯片
-NVIDIA GPU → 人工智能、算力数据中心、半导体芯片
-US sanctions → 半导体芯片、信创软件、军工
-Fed rate decisions → 银行、证券、黄金、有色金属
-Oil price changes → 石油石化、化工、航运港口
+Apple orders -> 消费电子、半导体芯片
+NVIDIA GPU -> 人工智能、算力数据中心、半导体芯片
+US sanctions -> 半导体芯片、信创软件、军工
+Fed rate decisions -> 银行、证券、黄金、有色金属
+Oil price changes -> 石油石化、化工、航运港口
 ```
 
 These events are shown separately from regular sector news and mapped to related A-share sectors.
@@ -143,17 +161,20 @@ data/sectors_config.json
 data/events_config.json
 ```
 
-For deployment, you can override the data directory with:
+You can still override the data directory with `DATA_DIR` when running on your own infrastructure:
 
 ```bash
-DATA_DIR=/var/data
+DATA_DIR=/path/to/data
 ```
+
+Do not commit `data/news_cache.csv` to Git.
 
 ## Notes
 
 - The app depends on third-party data sources, so news fetching may fail when the upstream API is unstable.
 - Incremental refresh depends on `publish_time`.
 - Local cache files should not be committed to Git.
+- Local files under `./data` are not reliable long-term storage on Streamlit Cloud.
 - This project is for information monitoring only and does not provide financial advice.
 
 ## Deploy

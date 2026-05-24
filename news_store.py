@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import pandas as pd
 
-from fetcher import deduplicate_news
+from classifier import LLMValidationCache, LLMVerifier
+from fetcher import deduplicate_news, filter_external_event_news, high_risk_sector_rules
 from paths import DATA_DIR
 
 
@@ -79,7 +80,10 @@ def read_cache(path: Path = CACHE_PATH) -> CacheReadResult:
     try:
         df = pd.read_csv(path, dtype=str, keep_default_na=False)
     except Exception as exc:
-        return CacheReadResult(data=empty_cache_frame(), error=f"读取本地缓存失败：{exc}")
+        return CacheReadResult(
+            data=empty_cache_frame(),
+            error=f"读取本地缓存失败：{type(exc).__name__}",
+        )
 
     return CacheReadResult(data=_normalize_cache_frame(df))
 
@@ -202,6 +206,108 @@ def combine_cache_frames(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
     if not normalized_frames:
         return empty_cache_frame()
     return _normalize_cache_frame(pd.concat(normalized_frames, ignore_index=True))
+
+
+def refilter_external_event_cache(
+    df: pd.DataFrame,
+    external_events: dict[str, list[Any]],
+    sectors_config: dict[str, Any] | None = None,
+    llm_verifier: LLMVerifier | None = None,
+    llm_cache: LLMValidationCache | None = None,
+) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    warnings: list[str] = []
+    try:
+        normalized = _normalize_cache_frame(df)
+    except Exception as exc:
+        return empty_cache_frame(), (f"缓存重过滤失败，已丢弃缓存数据：{exc}",)
+
+    if normalized.empty:
+        return normalized, ()
+
+    if df is not None and not df.empty and "news_type" not in df.columns:
+        warnings.append("缓存缺少 news_type 字段，无法识别外部事件缓存，已按普通新闻保留。")
+
+    kept_frames: list[pd.DataFrame] = []
+    sector_df = normalized[normalized["news_type"].ne("external_event")]
+    if not sector_df.empty:
+        for sector, group_df in sector_df.groupby("sector", sort=False):
+            sector_name = str(sector or "").strip()
+            sector_config = (
+                sectors_config.get(sector_name)
+                if isinstance(sectors_config, dict)
+                else None
+            )
+            sector_rules = high_risk_sector_rules(sector_name, sector_config)
+            if not sector_rules:
+                kept_frames.append(group_df)
+                continue
+
+            try:
+                filtered_df = filter_external_event_news(
+                    group_df,
+                    sector_name,
+                    sector_rules,
+                    llm_verifier=llm_verifier,
+                    llm_cache=llm_cache,
+                )
+            except Exception as exc:
+                warnings.append(
+                    f"高风险板块缓存「{sector_name}」重过滤失败，"
+                    f"已丢弃 {len(group_df)} 条缓存新闻：{exc}"
+                )
+                continue
+
+            kept_count = len(filtered_df) if not filtered_df.empty else 0
+            dropped_count = len(group_df) - kept_count
+            if dropped_count > 0:
+                warnings.append(
+                    f"高风险板块缓存「{sector_name}」已按新规则过滤 {dropped_count} 条旧缓存新闻。"
+                )
+            if kept_count > 0:
+                kept_frames.append(_normalize_cache_frame(filtered_df))
+
+    external_df = normalized[normalized["news_type"].eq("external_event")]
+    if external_df.empty:
+        return combine_cache_frames(kept_frames), tuple(warnings)
+
+    if not isinstance(external_events, dict):
+        warnings.append("外部事件规则配置无效，已丢弃缓存中的外部事件新闻。")
+        return combine_cache_frames(kept_frames), tuple(warnings)
+
+    for event_category, category_df in external_df.groupby("event_category", sort=False):
+        category_name = str(event_category or "").strip()
+        if not category_name or category_name not in external_events:
+            warnings.append(
+                f"外部事件缓存类别「{category_name or '未分类'}」缺少规则，"
+                f"已丢弃 {len(category_df)} 条缓存新闻。"
+            )
+            continue
+
+        try:
+            filtered_df = filter_external_event_news(
+                category_df,
+                category_name,
+                external_events[category_name],
+                llm_verifier=llm_verifier,
+                llm_cache=llm_cache,
+            )
+        except Exception as exc:
+            warnings.append(
+                f"外部事件缓存类别「{category_name}」重过滤失败，"
+                f"已丢弃 {len(category_df)} 条缓存新闻：{exc}"
+            )
+            continue
+
+        kept_count = len(filtered_df) if not filtered_df.empty else 0
+        dropped_count = len(category_df) - kept_count
+        if dropped_count > 0:
+            warnings.append(
+                f"外部事件缓存类别「{category_name}」已按新规则过滤 {dropped_count} 条旧缓存新闻。"
+            )
+        if kept_count > 0:
+            kept_frames.append(_normalize_cache_frame(filtered_df))
+
+    return combine_cache_frames(kept_frames), tuple(warnings)
 
 
 def deduplicate_cache(df: pd.DataFrame) -> pd.DataFrame:
