@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -10,6 +9,7 @@ import pandas as pd
 from classifier import LLMValidationCache, LLMVerifier
 from fetcher import deduplicate_news, filter_external_event_news, high_risk_sector_rules
 from paths import DATA_DIR
+from time_utils import utc_now_iso
 
 
 CACHE_PATH = DATA_DIR / "news_cache.csv"
@@ -110,7 +110,7 @@ def cache_metadata(df: pd.DataFrame) -> dict[str, str | int]:
             "latest_publish_time": "无",
         }
 
-    fetched_times = pd.to_datetime(normalized["fetched_at"], errors="coerce")
+    fetched_times = pd.to_datetime(normalized["fetched_at"], errors="coerce", utc=True)
     publish_times = pd.to_datetime(normalized["publish_time"], errors="coerce")
     latest_fetched_at = fetched_times.max()
     latest_publish_time = publish_times.max()
@@ -118,7 +118,7 @@ def cache_metadata(df: pd.DataFrame) -> dict[str, str | int]:
     return {
         "total": len(normalized),
         "latest_fetched_at": (
-            latest_fetched_at.strftime("%Y-%m-%d %H:%M:%S")
+            latest_fetched_at.isoformat().replace("+00:00", "Z")
             if pd.notna(latest_fetched_at)
             else "无"
         ),
@@ -163,7 +163,7 @@ def display_to_cache(
     reason: str = "",
 ) -> pd.DataFrame:
     if fetched_at is None:
-        fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fetched_at = utc_now_iso()
 
     if news_df is None or news_df.empty:
         return empty_cache_frame()

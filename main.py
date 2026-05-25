@@ -1,4 +1,3 @@
-from datetime import datetime
 from html import escape
 from typing import Any
 
@@ -43,6 +42,7 @@ from news_store import (
     save_cache,
 )
 from sectors import SECTORS as DEFAULT_SECTORS
+from time_utils import format_utc8_time, utc_now_iso
 
 
 st.set_page_config(page_title="A股板块新闻", page_icon="📰", layout="wide")
@@ -533,7 +533,7 @@ def fetch_selected_sector_cache(
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     fetched_frames: list[pd.DataFrame] = []
     warnings_by_sector: dict[str, list[str]] = {}
-    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fetched_at = utc_now_iso()
 
     for sector in selected_sectors:
         sector_warnings: list[str] = []
@@ -567,7 +567,7 @@ def fetch_external_event_cache(
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     fetched_frames: list[pd.DataFrame] = []
     warnings_by_event: dict[str, list[str]] = {}
-    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fetched_at = utc_now_iso()
 
     for event_category, keywords in external_events.items():
         event_warnings: list[str] = []
@@ -1367,7 +1367,7 @@ def main() -> None:
         displayed_total += min(len(filtered_external_df), max_items)
 
     metadata = cache_metadata(cache_df)
-    latest_cache_at = str(metadata["latest_fetched_at"])
+    latest_cache_at = format_utc8_time(metadata["latest_fetched_at"])
     render_dashboard_header(
         selected_count=len(selected_sectors),
         displayed_total=displayed_total,
