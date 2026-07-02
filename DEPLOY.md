@@ -102,6 +102,50 @@ export SUPABASE_KEY="service_role key"
 
 配置生效后，页面上的「缓存后端」会从「本地文件」变为「Supabase」。
 
+## 后台定时抓取：GitHub Actions
+
+配置后 GitHub Actions 会定时抓取全部板块和外部事件并写入 Supabase，打开页面即可看到最新数据，无需手动点刷新。定时任务与页面完全解耦，Streamlit Cloud 休眠也不影响数据更新。
+
+### 1. 配置仓库 Secrets
+
+打开 GitHub 仓库 → Settings → Secrets and variables → Actions → New repository secret，添加：
+
+- `SUPABASE_URL`：与 Streamlit secrets 中相同
+- `SUPABASE_KEY`：与 Streamlit secrets 中相同（service_role key）
+
+如需在后台抓取中启用 LLM 反向校验，再添加 `LLM_VERIFY_PROVIDER` 和对应的 `DOUBAO_*` / `DEEPSEEK_*`。不加则跳过 LLM 校验，只用规则过滤。
+
+### 2. 抓取频率
+
+`.github/workflows/refresh-news.yml` 中的默认排程（北京时间）：
+
+- 08:00-24:00 每 30 分钟一次（覆盖交易时段和晚间新闻高峰）
+- 01:00-07:00 每小时一次
+
+也可以在仓库的 Actions 页面选择 Refresh news cache → Run workflow 手动触发一次。
+
+### 3. 缓存保留期
+
+后台任务默认清理 30 天前的旧新闻，避免 Supabase 表无限膨胀。修改 workflow 中的命令即可调整：
+
+```bash
+python refresh_job.py --mode incremental --retention-days 60
+```
+
+### 注意事项
+
+- GitHub Actions 的 cron 使用 UTC 时间，且高峰期可能延迟几分钟执行。
+- 公开仓库的 Actions 免费无限量；私有仓库每月有免费分钟数额度。
+- 免费账号的仓库若连续 60 天没有任何提交活动，GitHub 会自动暂停定时任务，收到邮件提醒后去 Actions 页面点击恢复即可。
+- 页面读取缓存有最长 10 分钟的展示缓存；点击侧边栏「重新加载缓存」可立即加载最新数据。
+
+本地也可以直接运行同一个脚本：
+
+```bash
+python refresh_job.py                  # 增量
+python refresh_job.py --mode full      # 全量重建
+```
+
 ## Streamlit Cloud 休眠说明
 
 Streamlit Community Cloud 12 小时无访问会休眠。休眠后再次访问会自动唤醒，但本地文件不应被视为可靠的长期存储。

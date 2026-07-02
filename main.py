@@ -1,4 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor
 from html import escape
 from typing import Any
 
@@ -22,29 +21,20 @@ from config_store import (
     try_load_sectors_config,
     update_event_related_sectors,
 )
-from fetcher import (
-    SectorResult,
-    deduplicate_news,
-    fetch_external_event_news,
-    fetch_sector_news,
-)
+from fetcher import SectorResult, deduplicate_news
 from llm_provider import load_llm_verifier_from_env
 from news_store import (
     cache_backend_name,
     cache_metadata,
     cache_to_display,
     clear_cache,
-    combine_cache_frames,
-    deduplicate_cache,
-    display_to_cache,
-    filter_incremental_news,
-    merge_cache,
     read_cache,
     refilter_external_event_cache,
     save_cache,
 )
+from refresh import run_full_refresh, run_incremental_refresh
 from sectors import SECTORS as DEFAULT_SECTORS
-from time_utils import format_utc8_time, utc_now_iso
+from time_utils import format_utc8_time
 
 
 st.set_page_config(page_title="A股板块新闻", page_icon="📰", layout="wide")
@@ -567,137 +557,6 @@ def parse_keyword_input(value: str) -> list[str]:
         for item in str(value or "").replace("，", ",").split(",")
         if item.strip()
     ]
-
-
-# 板块/事件类别层面的抓取并发数；每个板块内部的关键词还有一层并发，
-# 两层相乘就是对上游接口的最大并发请求数，不宜设得过大。
-MAX_GROUP_FETCH_WORKERS = 3
-
-
-def fetch_selected_sector_cache(
-    selected_sectors: list[str],
-    sectors_config: dict[str, Any],
-    llm_verifier: LLMVerifier | None = None,
-) -> tuple[pd.DataFrame, dict[str, list[str]]]:
-    fetched_frames: list[pd.DataFrame] = []
-    warnings_by_sector: dict[str, list[str]] = {}
-    fetched_at = utc_now_iso()
-    if not selected_sectors:
-        return combine_cache_frames(fetched_frames), warnings_by_sector
-
-    max_workers = min(MAX_GROUP_FETCH_WORKERS, len(selected_sectors))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            sector: executor.submit(
-                fetch_sector_news,
-                sector,
-                sectors_config[sector],
-                llm_verifier=llm_verifier,
-            )
-            for sector in selected_sectors
-        }
-        for sector, future in futures.items():
-            sector_warnings: list[str] = []
-            try:
-                result = future.result()
-            except Exception as exc:
-                warnings_by_sector[sector] = [f"{sector} 抓取失败：{exc}"]
-                continue
-
-            if result.error:
-                sector_warnings.append(result.error)
-            if result.warnings:
-                sector_warnings.extend(result.warnings)
-            if sector_warnings:
-                warnings_by_sector[sector] = sector_warnings
-
-            if not result.data.empty:
-                fetched_frames.append(
-                    display_to_cache(sector, result.data, fetched_at=fetched_at)
-                )
-
-    return combine_cache_frames(fetched_frames), warnings_by_sector
-
-
-def fetch_external_event_cache(
-    external_events: dict[str, list[Any]],
-    event_to_sectors: dict[str, list[str]],
-    llm_verifier: LLMVerifier | None = None,
-) -> tuple[pd.DataFrame, dict[str, list[str]]]:
-    fetched_frames: list[pd.DataFrame] = []
-    warnings_by_event: dict[str, list[str]] = {}
-    fetched_at = utc_now_iso()
-    if not external_events:
-        return combine_cache_frames(fetched_frames), warnings_by_event
-
-    max_workers = min(MAX_GROUP_FETCH_WORKERS, len(external_events))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            event_category: executor.submit(
-                fetch_external_event_news,
-                event_category,
-                keywords,
-                event_to_sectors=event_to_sectors,
-                llm_verifier=llm_verifier,
-            )
-            for event_category, keywords in external_events.items()
-        }
-        for event_category, future in futures.items():
-            event_warnings: list[str] = []
-            try:
-                result = future.result()
-            except Exception as exc:
-                warnings_by_event[event_category] = [f"{event_category} 抓取失败：{exc}"]
-                continue
-
-            if result.error:
-                event_warnings.append(result.error)
-            if result.warnings:
-                event_warnings.extend(result.warnings)
-            if event_warnings:
-                warnings_by_event[event_category] = event_warnings
-
-            if not result.data.empty:
-                fetched_frames.append(
-                    display_to_cache(
-                        "",
-                        result.data,
-                        fetched_at=fetched_at,
-                        news_type="external_event",
-                    )
-                )
-
-    return combine_cache_frames(fetched_frames), warnings_by_event
-
-
-def fetch_refresh_cache(
-    selected_sectors: list[str],
-    sectors_config: dict[str, Any],
-    external_events: dict[str, list[Any]],
-    event_to_sectors: dict[str, list[str]],
-    llm_verifier: LLMVerifier | None = None,
-) -> tuple[pd.DataFrame, dict[str, list[str]], dict[str, list[str]]]:
-    fetched_frames: list[pd.DataFrame] = []
-    sector_warnings: dict[str, list[str]] = {}
-
-    if selected_sectors:
-        sector_cache, sector_warnings = fetch_selected_sector_cache(
-            selected_sectors,
-            sectors_config,
-            llm_verifier=llm_verifier,
-        )
-        if not sector_cache.empty:
-            fetched_frames.append(sector_cache)
-
-    external_cache, external_warnings = fetch_external_event_cache(
-        external_events,
-        event_to_sectors,
-        llm_verifier=llm_verifier,
-    )
-    if not external_cache.empty:
-        fetched_frames.append(external_cache)
-
-    return combine_cache_frames(fetched_frames), sector_warnings, external_warnings
 
 
 def collect_sources(news_df: pd.DataFrame) -> list[str]:
@@ -1283,85 +1142,61 @@ def main() -> None:
 
     st.sidebar.divider()
     st.sidebar.subheader("数据更新")
+    if st.sidebar.button("重新加载缓存"):
+        st.session_state.cache_version += 1
+    st.sidebar.caption("后台定时抓取更新数据后，点击上方按钮可立即加载最新缓存。")
+
     if st.sidebar.button("增量刷新"):
         if selected_sectors or show_external_events:
-            with st.spinner("正在增量抓取新新闻，并合并到本地缓存..."):
-                existing_result = read_cache()
-                existing_cache, cache_refilter_warnings = refilter_external_event_cache(
-                    existing_result.data,
-                    external_events,
-                    sectors_config=sectors_config,
-                    llm_verifier=llm_verifier,
-                )
-                fetched_cache, warnings_by_sector, warnings_by_event = fetch_refresh_cache(
+            with st.spinner("正在增量抓取新新闻，并合并到缓存..."):
+                outcome = run_incremental_refresh(
                     selected_sectors,
                     sectors_config,
                     external_events,
                     event_to_sectors,
                     llm_verifier=llm_verifier,
                 )
-                incremental_cache = filter_incremental_news(existing_cache, fetched_cache)
-                merged_cache, _ = merge_cache(existing_cache, incremental_cache)
-                merged_cache, merge_refilter_warnings = refilter_external_event_cache(
-                    merged_cache,
-                    external_events,
-                    sectors_config=sectors_config,
-                    llm_verifier=llm_verifier,
-                )
-                added_count = max(len(merged_cache) - len(existing_cache), 0)
-                cache_warnings = [*cache_refilter_warnings, *merge_refilter_warnings]
-                if cache_warnings:
-                    warnings_by_event.setdefault("缓存重过滤", []).extend(cache_warnings)
                 try:
-                    save_cache(merged_cache)
+                    save_cache(outcome.cache)
                 except Exception as exc:
                     st.error(f"缓存保存失败，本次抓取结果未持久化：{exc}")
                 else:
-                    st.session_state.last_added_count = added_count
-                    st.session_state.last_sector_warnings = warnings_by_sector
-                    st.session_state.last_external_warnings = warnings_by_event
+                    st.session_state.last_added_count = outcome.added_count
+                    st.session_state.last_sector_warnings = outcome.sector_warnings
+                    st.session_state.last_external_warnings = outcome.event_warnings
                     st.session_state.cache_version += 1
-                    st.success(f"增量刷新完成，新增 {added_count} 条新闻。")
+                    st.success(f"增量刷新完成，新增 {outcome.added_count} 条新闻。")
         else:
             st.sidebar.warning("请至少选择一个板块，或切换为显示外部事件后再刷新。")
 
     if st.sidebar.button("全量刷新"):
         if selected_sectors or show_external_events:
-            with st.spinner("正在全量抓取所选板块，并重建本地缓存..."):
-                fetched_cache, warnings_by_sector, warnings_by_event = fetch_refresh_cache(
+            with st.spinner("正在全量抓取所选板块，并重建缓存..."):
+                outcome = run_full_refresh(
                     selected_sectors,
                     sectors_config,
                     external_events,
                     event_to_sectors,
                     llm_verifier=llm_verifier,
                 )
-                if fetched_cache.empty and (warnings_by_sector or warnings_by_event):
+                if outcome.fetch_failed:
                     st.session_state.last_added_count = 0
-                    st.session_state.last_sector_warnings = warnings_by_sector
-                    st.session_state.last_external_warnings = warnings_by_event
-                    st.warning("全量刷新未获取到有效数据，已保留原本地缓存。")
+                    st.session_state.last_sector_warnings = outcome.sector_warnings
+                    st.session_state.last_external_warnings = outcome.event_warnings
+                    st.warning("全量刷新未获取到有效数据，已保留原缓存。")
                 else:
-                    rebuilt_cache = deduplicate_cache(fetched_cache)
-                    rebuilt_cache, cache_refilter_warnings = refilter_external_event_cache(
-                        rebuilt_cache,
-                        external_events,
-                        sectors_config=sectors_config,
-                        llm_verifier=llm_verifier,
-                    )
-                    if cache_refilter_warnings:
-                        warnings_by_event.setdefault("缓存重过滤", []).extend(
-                            cache_refilter_warnings
-                        )
                     try:
-                        save_cache(rebuilt_cache)
+                        save_cache(outcome.cache)
                     except Exception as exc:
                         st.error(f"缓存保存失败，本次抓取结果未持久化：{exc}")
                     else:
-                        st.session_state.last_added_count = len(rebuilt_cache)
-                        st.session_state.last_sector_warnings = warnings_by_sector
-                        st.session_state.last_external_warnings = warnings_by_event
+                        st.session_state.last_added_count = outcome.added_count
+                        st.session_state.last_sector_warnings = outcome.sector_warnings
+                        st.session_state.last_external_warnings = outcome.event_warnings
                         st.session_state.cache_version += 1
-                        st.success(f"全量刷新完成，缓存已重建为 {len(rebuilt_cache)} 条新闻。")
+                        st.success(
+                            f"全量刷新完成，缓存已重建为 {outcome.added_count} 条新闻。"
+                        )
         else:
             st.sidebar.warning("请至少选择一个板块，或切换为显示外部事件后再全量刷新。")
 
