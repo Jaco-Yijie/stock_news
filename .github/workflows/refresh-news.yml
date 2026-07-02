@@ -1,0 +1,42 @@
+name: Refresh news cache
+
+on:
+  schedule:
+    # GitHub Actions 使用 UTC 时间；北京时间 = UTC + 8。
+    # 北京时间 08:00-24:00 每 30 分钟抓一次（覆盖 A 股交易时段和晚间新闻高峰）
+    - cron: "*/30 0-15 * * *"
+    # 北京时间凌晨 01:00-07:00 每小时抓一次
+    - cron: "0 17-23 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: refresh-news
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh news cache
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LLM_VERIFY_PROVIDER: ${{ secrets.LLM_VERIFY_PROVIDER }}
+          DOUBAO_API_KEY: ${{ secrets.DOUBAO_API_KEY }}
+          DOUBAO_ENDPOINT: ${{ secrets.DOUBAO_ENDPOINT }}
+          DOUBAO_MODEL: ${{ secrets.DOUBAO_MODEL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_ENDPOINT: ${{ secrets.DEEPSEEK_ENDPOINT }}
+          DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
+        run: python refresh_job.py --mode incremental
