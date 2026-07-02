@@ -1156,6 +1156,11 @@ def main() -> None:
                     event_to_sectors,
                     llm_verifier=llm_verifier,
                 )
+                if outcome.read_error:
+                    st.error(
+                        f"读取现有缓存失败，为避免误删数据本次未刷新：{outcome.read_error}"
+                    )
+                    st.stop()
                 try:
                     save_cache(outcome.cache)
                 except Exception as exc:
