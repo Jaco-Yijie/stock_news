@@ -42,6 +42,8 @@ from sectors import EVENT_TO_SECTORS, EXTERNAL_EVENTS, SECTORS
 
 DEFAULT_TIMEOUT = 10
 MAX_FETCH_WORKERS = 8
+AKSHARE_FAILURE_THRESHOLD = 3
+AKSHARE_SKIP_SECONDS = 600
 EASTMONEY_SEARCH_URL = "https://search-api-web.eastmoney.com/search/jsonp"
 DISPLAY_COLUMNS = ["标题", "来源媒体", "发布时间", "原文链接"]
 EXTERNAL_EVENT_COLUMNS = ["event_category", "related_sectors", "reason"]
@@ -494,13 +496,43 @@ def _fetch_from_eastmoney(keyword: str, timeout: int = DEFAULT_TIMEOUT) -> pd.Da
     return _empty_news_frame()
 
 
+# AKShare 熔断器：连续失败若干次后，在一段时间内直接使用东方财富数据源，
+# 避免在 AKShare 不可用的环境（如云端海外 IP）中每个关键词都等满超时时间。
+_AKSHARE_BREAKER_LOCK = Lock()
+_AKSHARE_CONSECUTIVE_FAILURES = 0
+_AKSHARE_SKIP_UNTIL = 0.0
+
+
+def _akshare_available() -> bool:
+    with _AKSHARE_BREAKER_LOCK:
+        return time.time() >= _AKSHARE_SKIP_UNTIL
+
+
+def _record_akshare_result(success: bool) -> None:
+    global _AKSHARE_CONSECUTIVE_FAILURES, _AKSHARE_SKIP_UNTIL
+    with _AKSHARE_BREAKER_LOCK:
+        if success:
+            _AKSHARE_CONSECUTIVE_FAILURES = 0
+            _AKSHARE_SKIP_UNTIL = 0.0
+            return
+        _AKSHARE_CONSECUTIVE_FAILURES += 1
+        if _AKSHARE_CONSECUTIVE_FAILURES >= AKSHARE_FAILURE_THRESHOLD:
+            _AKSHARE_SKIP_UNTIL = time.time() + AKSHARE_SKIP_SECONDS
+
+
 def fetch_keyword_news(keyword: str, timeout: int = DEFAULT_TIMEOUT) -> pd.DataFrame:
     akshare_error: Exception | None = None
 
-    try:
-        return _fetch_from_akshare(keyword, timeout=timeout)
-    except Exception as exc:
-        akshare_error = exc
+    if _akshare_available():
+        try:
+            result = _fetch_from_akshare(keyword, timeout=timeout)
+            _record_akshare_result(True)
+            return result
+        except Exception as exc:
+            _record_akshare_result(False)
+            akshare_error = exc
+    else:
+        akshare_error = RuntimeError("AKShare 近期连续失败，已暂时切换到东方财富数据源")
 
     try:
         return _fetch_from_eastmoney(keyword, timeout=timeout)

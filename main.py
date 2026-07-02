@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from html import escape
 from typing import Any
 
@@ -567,6 +568,11 @@ def parse_keyword_input(value: str) -> list[str]:
     ]
 
 
+# 板块/事件类别层面的抓取并发数；每个板块内部的关键词还有一层并发，
+# 两层相乘就是对上游接口的最大并发请求数，不宜设得过大。
+MAX_GROUP_FETCH_WORKERS = 3
+
+
 def fetch_selected_sector_cache(
     selected_sectors: list[str],
     sectors_config: dict[str, Any],
@@ -575,28 +581,39 @@ def fetch_selected_sector_cache(
     fetched_frames: list[pd.DataFrame] = []
     warnings_by_sector: dict[str, list[str]] = {}
     fetched_at = utc_now_iso()
+    if not selected_sectors:
+        return combine_cache_frames(fetched_frames), warnings_by_sector
 
-    for sector in selected_sectors:
-        sector_warnings: list[str] = []
-        try:
-            result = fetch_sector_news(
+    max_workers = min(MAX_GROUP_FETCH_WORKERS, len(selected_sectors))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            sector: executor.submit(
+                fetch_sector_news,
                 sector,
                 sectors_config[sector],
                 llm_verifier=llm_verifier,
             )
-        except Exception as exc:
-            warnings_by_sector[sector] = [f"{sector} 抓取失败：{exc}"]
-            continue
+            for sector in selected_sectors
+        }
+        for sector, future in futures.items():
+            sector_warnings: list[str] = []
+            try:
+                result = future.result()
+            except Exception as exc:
+                warnings_by_sector[sector] = [f"{sector} 抓取失败：{exc}"]
+                continue
 
-        if result.error:
-            sector_warnings.append(result.error)
-        if result.warnings:
-            sector_warnings.extend(result.warnings)
-        if sector_warnings:
-            warnings_by_sector[sector] = sector_warnings
+            if result.error:
+                sector_warnings.append(result.error)
+            if result.warnings:
+                sector_warnings.extend(result.warnings)
+            if sector_warnings:
+                warnings_by_sector[sector] = sector_warnings
 
-        if not result.data.empty:
-            fetched_frames.append(display_to_cache(sector, result.data, fetched_at=fetched_at))
+            if not result.data.empty:
+                fetched_frames.append(
+                    display_to_cache(sector, result.data, fetched_at=fetched_at)
+                )
 
     return combine_cache_frames(fetched_frames), warnings_by_sector
 
@@ -609,36 +626,45 @@ def fetch_external_event_cache(
     fetched_frames: list[pd.DataFrame] = []
     warnings_by_event: dict[str, list[str]] = {}
     fetched_at = utc_now_iso()
+    if not external_events:
+        return combine_cache_frames(fetched_frames), warnings_by_event
 
-    for event_category, keywords in external_events.items():
-        event_warnings: list[str] = []
-        try:
-            result = fetch_external_event_news(
+    max_workers = min(MAX_GROUP_FETCH_WORKERS, len(external_events))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            event_category: executor.submit(
+                fetch_external_event_news,
                 event_category,
                 keywords,
                 event_to_sectors=event_to_sectors,
                 llm_verifier=llm_verifier,
             )
-        except Exception as exc:
-            warnings_by_event[event_category] = [f"{event_category} 抓取失败：{exc}"]
-            continue
+            for event_category, keywords in external_events.items()
+        }
+        for event_category, future in futures.items():
+            event_warnings: list[str] = []
+            try:
+                result = future.result()
+            except Exception as exc:
+                warnings_by_event[event_category] = [f"{event_category} 抓取失败：{exc}"]
+                continue
 
-        if result.error:
-            event_warnings.append(result.error)
-        if result.warnings:
-            event_warnings.extend(result.warnings)
-        if event_warnings:
-            warnings_by_event[event_category] = event_warnings
+            if result.error:
+                event_warnings.append(result.error)
+            if result.warnings:
+                event_warnings.extend(result.warnings)
+            if event_warnings:
+                warnings_by_event[event_category] = event_warnings
 
-        if not result.data.empty:
-            fetched_frames.append(
-                display_to_cache(
-                    "",
-                    result.data,
-                    fetched_at=fetched_at,
-                    news_type="external_event",
+            if not result.data.empty:
+                fetched_frames.append(
+                    display_to_cache(
+                        "",
+                        result.data,
+                        fetched_at=fetched_at,
+                        news_type="external_event",
+                    )
                 )
-            )
 
     return combine_cache_frames(fetched_frames), warnings_by_event
 
