@@ -33,6 +33,7 @@ class RefreshOutcome:
     sector_warnings: dict[str, list[str]] = field(default_factory=dict)
     event_warnings: dict[str, list[str]] = field(default_factory=dict)
     fetch_failed: bool = False
+    read_error: str | None = None
 
 
 def fetch_selected_sector_cache(
@@ -169,6 +170,13 @@ def run_incremental_refresh(
     llm_verifier: LLMVerifier | None = None,
 ) -> RefreshOutcome:
     existing_result = read_cache()
+    if existing_result.error:
+        # 读不到已有缓存时继续增量合并会把缓存当成空的，
+        # 保存后可能误删历史数据，必须中止。
+        return RefreshOutcome(
+            cache=existing_result.data,
+            read_error=existing_result.error,
+        )
     existing_cache, cache_refilter_warnings = refilter_external_event_cache(
         existing_result.data,
         external_events,

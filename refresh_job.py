@@ -72,6 +72,10 @@ def main(argv: list[str] | None = None) -> int:
     _print_warnings("板块", outcome.sector_warnings)
     _print_warnings("事件", outcome.event_warnings)
 
+    if outcome.read_error:
+        print(f"[error] 读取现有缓存失败，为避免误删数据本次不写入：{outcome.read_error}")
+        return 1
+
     if outcome.fetch_failed:
         print("[error] 全量抓取未获取到有效数据，保留现有缓存，本次不写入。")
         return 1

@@ -19,15 +19,21 @@ class SupabaseError(RuntimeError):
     pass
 
 
+def _sanitize_credential(value: str) -> str:
+    # 粘贴长 key 时容易混入换行/空格，HTTP 头里不允许这些字符；
+    # URL 和 JWT 本身都不含空白字符，直接全部移除是安全的。
+    return "".join(str(value or "").split())
+
+
 def load_supabase_credentials() -> tuple[str, str] | None:
-    url = os.getenv("SUPABASE_URL", "").strip()
-    key = os.getenv("SUPABASE_KEY", "").strip()
+    url = _sanitize_credential(os.getenv("SUPABASE_URL", ""))
+    key = _sanitize_credential(os.getenv("SUPABASE_KEY", ""))
     if not url or not key:
         try:
             import streamlit as st
 
-            url = url or str(st.secrets.get("SUPABASE_URL", "")).strip()
-            key = key or str(st.secrets.get("SUPABASE_KEY", "")).strip()
+            url = url or _sanitize_credential(st.secrets.get("SUPABASE_URL", ""))
+            key = key or _sanitize_credential(st.secrets.get("SUPABASE_KEY", ""))
         except Exception:
             pass
     if url and key:
