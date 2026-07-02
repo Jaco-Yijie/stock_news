@@ -9,6 +9,7 @@ import pandas as pd
 from classifier import LLMValidationCache, LLMVerifier
 from fetcher import deduplicate_news, filter_external_event_news, high_risk_sector_rules
 from paths import DATA_DIR
+from supabase_store import SupabaseNewsStore, load_supabase_credentials
 from time_utils import utc_now_iso
 
 
@@ -73,7 +74,31 @@ def _normalize_cache_frame(df: pd.DataFrame) -> pd.DataFrame:
     return normalized.reset_index(drop=True)
 
 
+def get_supabase_store() -> SupabaseNewsStore | None:
+    credentials = load_supabase_credentials()
+    if credentials is None:
+        return None
+    return SupabaseNewsStore(credentials[0], credentials[1])
+
+
+def cache_backend_name() -> str:
+    return "Supabase" if load_supabase_credentials() is not None else "本地文件"
+
+
 def read_cache(path: Path = CACHE_PATH) -> CacheReadResult:
+    store = get_supabase_store()
+    if store is not None:
+        try:
+            rows = store.fetch_all()
+        except Exception as exc:
+            return CacheReadResult(
+                data=empty_cache_frame(),
+                error=f"读取 Supabase 缓存失败：{exc}",
+            )
+        if not rows:
+            return CacheReadResult(data=empty_cache_frame())
+        return CacheReadResult(data=_normalize_cache_frame(pd.DataFrame(rows)))
+
     if not path.exists() or path.stat().st_size == 0:
         return CacheReadResult(data=empty_cache_frame())
 
@@ -89,14 +114,24 @@ def read_cache(path: Path = CACHE_PATH) -> CacheReadResult:
 
 
 def save_cache(df: pd.DataFrame, path: Path = CACHE_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     normalized = _normalize_cache_frame(df)
+
+    store = get_supabase_store()
+    if store is not None:
+        store.replace_all(normalized.to_dict("records"))
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp")
     normalized.to_csv(tmp_path, index=False)
     tmp_path.replace(path)
 
 
 def clear_cache(path: Path = CACHE_PATH) -> None:
+    store = get_supabase_store()
+    if store is not None:
+        store.delete_all()
+
     if path.exists():
         path.unlink()
 

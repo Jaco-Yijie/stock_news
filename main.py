@@ -30,6 +30,7 @@ from fetcher import (
 )
 from llm_provider import load_llm_verifier_from_env
 from news_store import (
+    cache_backend_name,
     cache_metadata,
     cache_to_display,
     clear_cache,
@@ -1311,12 +1312,16 @@ def main() -> None:
                 cache_warnings = [*cache_refilter_warnings, *merge_refilter_warnings]
                 if cache_warnings:
                     warnings_by_event.setdefault("缓存重过滤", []).extend(cache_warnings)
-                save_cache(merged_cache)
-                st.session_state.last_added_count = added_count
-                st.session_state.last_sector_warnings = warnings_by_sector
-                st.session_state.last_external_warnings = warnings_by_event
-                st.session_state.cache_version += 1
-                st.success(f"增量刷新完成，新增 {added_count} 条新闻。")
+                try:
+                    save_cache(merged_cache)
+                except Exception as exc:
+                    st.error(f"缓存保存失败，本次抓取结果未持久化：{exc}")
+                else:
+                    st.session_state.last_added_count = added_count
+                    st.session_state.last_sector_warnings = warnings_by_sector
+                    st.session_state.last_external_warnings = warnings_by_event
+                    st.session_state.cache_version += 1
+                    st.success(f"增量刷新完成，新增 {added_count} 条新闻。")
         else:
             st.sidebar.warning("请至少选择一个板块，或切换为显示外部事件后再刷新。")
 
@@ -1347,24 +1352,32 @@ def main() -> None:
                         warnings_by_event.setdefault("缓存重过滤", []).extend(
                             cache_refilter_warnings
                         )
-                    save_cache(rebuilt_cache)
-                    st.session_state.last_added_count = len(rebuilt_cache)
-                    st.session_state.last_sector_warnings = warnings_by_sector
-                    st.session_state.last_external_warnings = warnings_by_event
-                    st.session_state.cache_version += 1
-                    st.success(f"全量刷新完成，缓存已重建为 {len(rebuilt_cache)} 条新闻。")
+                    try:
+                        save_cache(rebuilt_cache)
+                    except Exception as exc:
+                        st.error(f"缓存保存失败，本次抓取结果未持久化：{exc}")
+                    else:
+                        st.session_state.last_added_count = len(rebuilt_cache)
+                        st.session_state.last_sector_warnings = warnings_by_sector
+                        st.session_state.last_external_warnings = warnings_by_event
+                        st.session_state.cache_version += 1
+                        st.success(f"全量刷新完成，缓存已重建为 {len(rebuilt_cache)} 条新闻。")
         else:
             st.sidebar.warning("请至少选择一个板块，或切换为显示外部事件后再全量刷新。")
 
     confirm_clear_cache = st.sidebar.checkbox("确认要清空本地缓存")
     if st.sidebar.button("确认清空本地缓存"):
         if confirm_clear_cache:
-            clear_cache()
-            st.session_state.last_added_count = 0
-            st.session_state.last_sector_warnings = {}
-            st.session_state.last_external_warnings = {}
-            st.session_state.cache_version += 1
-            st.warning("本地缓存已清空。")
+            try:
+                clear_cache()
+            except Exception as exc:
+                st.error(f"清空缓存失败：{exc}")
+            else:
+                st.session_state.last_added_count = 0
+                st.session_state.last_sector_warnings = {}
+                st.session_state.last_external_warnings = {}
+                st.session_state.cache_version += 1
+                st.warning("缓存已清空。")
         else:
             st.sidebar.warning("请先勾选确认项，避免误清空缓存。")
 
@@ -1438,7 +1451,7 @@ def main() -> None:
         added_count=int(st.session_state.last_added_count),
     )
 
-    st.caption("本地缓存已启用")
+    st.caption(f"缓存后端：{cache_backend_name()}")
     st.caption(f"缓存更新时间：{latest_cache_at}")
     if raw_cache_display_df.empty:
         st.info("本地缓存暂无新闻。点击左侧“增量刷新”进行首次抓取，或点击“全量刷新”重建缓存。")
