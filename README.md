@@ -85,8 +85,8 @@ http://localhost:8501
 注意事项：
 
 - Streamlit Community Cloud 12 小时无访问会休眠。
-- Streamlit Cloud 上的本地 `./data` 文件不适合长期线上持久化；应用重建、重启或环境变化时，缓存和在线编辑的配置可能丢失。
-- 长期保存新闻缓存和配置，建议后续接 Supabase 或 Neon。
+- Streamlit Cloud 上的本地 `./data` 文件不适合长期线上持久化；应用重建、重启或环境变化时，本地文件缓存和在线编辑的配置可能丢失。
+- 新闻缓存持久化已支持 Supabase：配置 `SUPABASE_URL` 和 `SUPABASE_KEY` 后缓存保存在 Supabase Postgres 中，重启不丢失。配置步骤见 [DEPLOY.md](DEPLOY.md)。
 
 ## Project Structure
 
@@ -95,7 +95,8 @@ stock_news/
 ├── main.py              # Streamlit web interface
 ├── fetcher.py           # News fetching and deduplication logic
 ├── sectors.py           # Default sector and external event configuration
-├── news_store.py        # Local news cache read/write logic
+├── news_store.py        # News cache read/write logic (local CSV or Supabase)
+├── supabase_store.py    # Supabase (PostgREST) cache backend
 ├── config_store.py      # Editable sector/event config storage
 ├── paths.py             # Shared data directory path config
 ├── requirements.txt     # Python dependencies
