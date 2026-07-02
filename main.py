@@ -512,10 +512,51 @@ def inject_styles() -> None:
     )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_cached_news(cache_version: int):
+def llm_verifier_cache_key(llm_verifier: LLMVerifier | None) -> str:
+    if llm_verifier is None:
+        return "none"
+    return "|".join(
+        str(getattr(llm_verifier, attr, ""))
+        for attr in ("provider", "model", "prompt_version", "rule_version")
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_display_data(
+    cache_version: int,
+    sectors_config: dict[str, Any],
+    external_events: dict[str, Any],
+    llm_cache_key: str,
+    _llm_verifier: LLMVerifier | None,
+):
+    """读取缓存并完成重过滤、格式转换、去重。
+
+    整条流水线只在缓存版本或配置变化时重算，
+    普通页面交互（筛选、搜索、翻页等）直接复用结果。
+    """
     cache_result = read_cache()
-    return cache_result.data, cache_result.error
+    cache_df, refilter_warnings = refilter_external_event_cache(
+        cache_result.data,
+        external_events,
+        sectors_config=sectors_config,
+        llm_verifier=_llm_verifier,
+    )
+    display_df = cache_to_display(cache_df)
+    sector_display_df = deduplicate_display_news(
+        display_df[display_df["news_type"].ne("external_event")].reset_index(drop=True),
+        group_column="sector",
+    )
+    external_display_df = deduplicate_display_news(
+        display_df[display_df["news_type"].eq("external_event")].reset_index(drop=True)
+    )
+    return (
+        display_df,
+        sector_display_df,
+        external_display_df,
+        cache_metadata(cache_df),
+        cache_result.error,
+        refilter_warnings,
+    )
 
 
 def parse_keyword_input(value: str) -> list[str]:
@@ -1305,31 +1346,27 @@ def main() -> None:
         st.info("请至少选择一个板块。")
         return
 
-    cache_df, cache_error = load_cached_news(st.session_state.cache_version)
+    (
+        raw_cache_display_df,
+        sector_deduped_df,
+        external_deduped_df,
+        metadata,
+        cache_error,
+        cache_refilter_warnings,
+    ) = load_display_data(
+        st.session_state.cache_version,
+        sectors_config,
+        external_events,
+        llm_verifier_cache_key(llm_verifier),
+        llm_verifier,
+    )
     if cache_error:
         st.warning(cache_error + "。页面将显示空缓存，可点击全量刷新重建。")
-    cache_df, cache_refilter_warnings = refilter_external_event_cache(
-        cache_df,
-        external_events,
-        sectors_config=sectors_config,
-        llm_verifier=llm_verifier,
-    )
     if cache_refilter_warnings:
         st.warning("；".join(cache_refilter_warnings))
 
-    raw_cache_display_df = cache_to_display(cache_df)
-    cache_display_df = filter_news_by_time(raw_cache_display_df, time_range)
-    sector_cache_display_df = cache_display_df[
-        cache_display_df["news_type"].ne("external_event")
-    ].reset_index(drop=True)
-    external_display_df = cache_display_df[
-        cache_display_df["news_type"].eq("external_event")
-    ].reset_index(drop=True)
-    sector_cache_display_df = deduplicate_display_news(
-        sector_cache_display_df,
-        group_column="sector",
-    )
-    external_display_df = deduplicate_display_news(external_display_df)
+    sector_cache_display_df = filter_news_by_time(sector_deduped_df, time_range)
+    external_display_df = filter_news_by_time(external_deduped_df, time_range)
     selected_cache_display_df = sector_cache_display_df[
         sector_cache_display_df["sector"].isin(selected_sectors)
     ].reset_index(drop=True)
@@ -1366,7 +1403,6 @@ def main() -> None:
         filtered_external_df = filter_news(external_display_df, keyword, selected_sources)
         displayed_total += min(len(filtered_external_df), max_items)
 
-    metadata = cache_metadata(cache_df)
     latest_cache_at = format_utc8_time(metadata["latest_fetched_at"])
     render_dashboard_header(
         selected_count=len(selected_sectors),
@@ -1380,7 +1416,7 @@ def main() -> None:
     st.caption(f"缓存更新时间：{latest_cache_at}")
     if raw_cache_display_df.empty:
         st.info("本地缓存暂无新闻。点击左侧“增量刷新”进行首次抓取，或点击“全量刷新”重建缓存。")
-    elif cache_display_df.empty:
+    elif sector_cache_display_df.empty and external_display_df.empty:
         st.info("当前时间范围下暂无新闻。")
 
     if show_external_events:

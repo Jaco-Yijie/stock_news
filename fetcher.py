@@ -41,6 +41,7 @@ from sectors import EVENT_TO_SECTORS, EXTERNAL_EVENTS, SECTORS
 
 
 DEFAULT_TIMEOUT = 10
+MAX_FETCH_WORKERS = 8
 EASTMONEY_SEARCH_URL = "https://search-api-web.eastmoney.com/search/jsonp"
 DISPLAY_COLUMNS = ["标题", "来源媒体", "发布时间", "原文链接"]
 EXTERNAL_EVENT_COLUMNS = ["event_category", "related_sectors", "reason"]
@@ -217,12 +218,31 @@ def _is_similar_title(title: str, kept_titles: list[str]) -> bool:
     if not title:
         return False
 
+    matcher = SequenceMatcher()
+    matcher.set_seq2(title)
+    title_len = len(title)
     for kept_title in kept_titles:
         if not kept_title:
             continue
-        if SequenceMatcher(None, title, kept_title).ratio() >= TITLE_SIMILARITY_THRESHOLD:
+        # 长度差过大时 ratio 不可能达到阈值，直接跳过昂贵的比较
+        if 2 * min(title_len, len(kept_title)) < TITLE_SIMILARITY_THRESHOLD * (
+            title_len + len(kept_title)
+        ):
+            continue
+        matcher.set_seq1(kept_title)
+        if matcher.real_quick_ratio() < TITLE_SIMILARITY_THRESHOLD:
+            continue
+        if matcher.quick_ratio() < TITLE_SIMILARITY_THRESHOLD:
+            continue
+        if matcher.ratio() >= TITLE_SIMILARITY_THRESHOLD:
             return True
     return False
+
+
+def _column_values(df: pd.DataFrame, column: str) -> list[Any]:
+    if column in df.columns:
+        return df[column].tolist()
+    return [""] * len(df)
 
 
 def deduplicate_news(df: pd.DataFrame) -> pd.DataFrame:
@@ -230,16 +250,20 @@ def deduplicate_news(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     sorted_df = _sort_news(df)
-    kept_indices: list[int] = []
+    link_keys = [_normalize_link_for_dedupe(v) for v in _column_values(sorted_df, "原文链接")]
+    title_keys = [_normalize_title_for_dedupe(v) for v in _column_values(sorted_df, "标题")]
+    content_keys = [_normalize_text_for_dedupe(v) for v in _column_values(sorted_df, "新闻内容")]
+
+    kept_positions: list[int] = []
     seen_links: set[str] = set()
     seen_titles: set[str] = set()
     seen_contents: set[str] = set()
     kept_titles: list[str] = []
 
-    for index, row in sorted_df.iterrows():
-        link_key = _normalize_link_for_dedupe(row.get("原文链接", ""))
-        title_key = _normalize_title_for_dedupe(row.get("标题", ""))
-        content_key = _normalize_text_for_dedupe(row.get("新闻内容", ""))
+    for position in range(len(sorted_df)):
+        link_key = link_keys[position]
+        title_key = title_keys[position]
+        content_key = content_keys[position]
 
         is_duplicate = False
         if link_key and link_key in seen_links:
@@ -254,7 +278,7 @@ def deduplicate_news(df: pd.DataFrame) -> pd.DataFrame:
         if is_duplicate:
             continue
 
-        kept_indices.append(index)
+        kept_positions.append(position)
         if link_key:
             seen_links.add(link_key)
         if title_key:
@@ -263,52 +287,62 @@ def deduplicate_news(df: pd.DataFrame) -> pd.DataFrame:
         if content_key:
             seen_contents.add(content_key)
 
-    return sorted_df.loc[kept_indices].reset_index(drop=True)
+    return sorted_df.iloc[kept_positions].reset_index(drop=True)
 
 
-@contextmanager
-def _akshare_regex_compat():
-    if StringMethods is None:
-        yield
-        return
+_ORIGINAL_STRING_REPLACE = StringMethods.replace if StringMethods is not None else None
+_PANDAS_REPLACE_PATCH_DEPTH = 0
 
-    original_replace = StringMethods.replace
 
-    def patched_replace(
-        self,
-        pat,
-        repl,
-        n=-1,
-        case=None,
-        flags=0,
-        regex=False,
-    ):
-        if pat == r"\u3000" and regex is True:
-            return original_replace(
-                self,
-                "\u3000",
-                repl,
-                n=n,
-                case=case,
-                flags=flags,
-                regex=False,
-            )
-        return original_replace(
+def _patched_string_replace(
+    self,
+    pat,
+    repl,
+    n=-1,
+    case=None,
+    flags=0,
+    regex=False,
+):
+    if pat == r"\u3000" and regex is True:
+        return _ORIGINAL_STRING_REPLACE(
             self,
-            pat,
+            "\u3000",
             repl,
             n=n,
             case=case,
             flags=flags,
-            regex=regex,
+            regex=False,
         )
+    return _ORIGINAL_STRING_REPLACE(
+        self,
+        pat,
+        repl,
+        n=n,
+        case=case,
+        flags=flags,
+        regex=regex,
+    )
+
+
+@contextmanager
+def _akshare_regex_compat():
+    # \u5f15\u7528\u8ba1\u6570\u5f0f\u8865\u4e01\uff1a\u9501\u53ea\u4fdd\u62a4\u8ba1\u6570\u5668\uff0c\u6293\u53d6\u672c\u8eab\u53ef\u4ee5\u5e76\u53d1\u8fdb\u884c
+    global _PANDAS_REPLACE_PATCH_DEPTH
+    if StringMethods is None:
+        yield
+        return
 
     with PANDAS_REPLACE_PATCH_LOCK:
-        StringMethods.replace = patched_replace
-        try:
-            yield
-        finally:
-            StringMethods.replace = original_replace
+        if _PANDAS_REPLACE_PATCH_DEPTH == 0:
+            StringMethods.replace = _patched_string_replace
+        _PANDAS_REPLACE_PATCH_DEPTH += 1
+    try:
+        yield
+    finally:
+        with PANDAS_REPLACE_PATCH_LOCK:
+            _PANDAS_REPLACE_PATCH_DEPTH -= 1
+            if _PANDAS_REPLACE_PATCH_DEPTH == 0:
+                StringMethods.replace = _ORIGINAL_STRING_REPLACE
 
 
 def _fetch_from_akshare(keyword: str, timeout: int = DEFAULT_TIMEOUT) -> pd.DataFrame:
@@ -477,6 +511,37 @@ def fetch_keyword_news(keyword: str, timeout: int = DEFAULT_TIMEOUT) -> pd.DataF
         ) from exc
 
 
+def _fetch_keywords_news(
+    query_keywords: list[str],
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[list[pd.DataFrame], list[str]]:
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    if not query_keywords:
+        return frames, errors
+
+    if len(query_keywords) == 1:
+        keyword = query_keywords[0]
+        try:
+            frames.append(fetch_keyword_news(keyword, timeout=timeout))
+        except Exception as exc:
+            errors.append(f"{keyword}: {exc}")
+        return frames, errors
+
+    max_workers = min(MAX_FETCH_WORKERS, len(query_keywords))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            keyword: executor.submit(fetch_keyword_news, keyword, timeout=timeout)
+            for keyword in query_keywords
+        }
+        for keyword, future in futures.items():
+            try:
+                frames.append(future.result())
+            except Exception as exc:
+                errors.append(f"{keyword}: {exc}")
+    return frames, errors
+
+
 def _rules_for_sector_rule_id(rule_id: str) -> list[Any]:
     normalized = str(rule_id or "").strip().casefold().replace(" ", "").replace("／", "/")
     if normalized in {"visionpro", "vision_pro", "vision-pro"}:
@@ -517,14 +582,7 @@ def fetch_sector_news(
     sector_config = keywords
     query_keywords = extract_sector_keywords(sector_config)
 
-    frames: list[pd.DataFrame] = []
-    errors: list[str] = []
-
-    for keyword in query_keywords:
-        try:
-            frames.append(fetch_keyword_news(keyword, timeout=timeout))
-        except Exception as exc:
-            errors.append(f"{keyword}: {exc}")
+    frames, errors = _fetch_keywords_news(query_keywords, timeout=timeout)
 
     if not frames:
         return SectorResult(
@@ -597,10 +655,11 @@ def filter_external_event_news(
 ) -> pd.DataFrame:
     if news_df is None or news_df.empty:
         return _empty_news_frame()
+    if llm_verifier is not None and llm_cache is None:
+        llm_cache = DEFAULT_LLM_VALIDATION_CACHE
 
-    kept_rows: list[pd.Series] = []
-    for _, row in news_df.iterrows():
-        news = row.to_dict()
+    kept_positions: list[int] = []
+    for position, news in enumerate(news_df.to_dict("records")):
         classification = classify_news_item(news, event_category, event_rules)
         if not classification.matched:
             continue
@@ -617,11 +676,11 @@ def filter_external_event_news(
         if validation.category and validation.category != event_category:
             continue
 
-        kept_rows.append(row)
+        kept_positions.append(position)
 
-    if not kept_rows:
+    if not kept_positions:
         return _empty_news_frame()
-    return pd.DataFrame(kept_rows, columns=news_df.columns).reset_index(drop=True)
+    return news_df.iloc[kept_positions].reset_index(drop=True)
 
 
 def fetch_external_event_news(
@@ -639,14 +698,7 @@ def fetch_external_event_news(
     event_rules = normalize_event_rules({event_category: keywords}).get(event_category, [])
     query_keywords = extract_rule_keywords(event_rules)
 
-    frames: list[pd.DataFrame] = []
-    errors: list[str] = []
-
-    for keyword in query_keywords:
-        try:
-            frames.append(fetch_keyword_news(keyword, timeout=timeout))
-        except Exception as exc:
-            errors.append(f"{keyword}: {exc}")
+    frames, errors = _fetch_keywords_news(query_keywords, timeout=timeout)
 
     if not frames:
         return SectorResult(
