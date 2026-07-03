@@ -85,6 +85,20 @@ def cache_backend_name() -> str:
     return "Supabase" if load_supabase_credentials() is not None else "本地文件"
 
 
+def cache_fingerprint(path: Path = CACHE_PATH) -> str:
+    """缓存数据的轻量指纹：数据有更新时指纹变化，用于自动失效展示缓存。"""
+    store = get_supabase_store()
+    if store is not None:
+        try:
+            return f"supabase:{store.latest_fetched_at()}"
+        except Exception:
+            return "supabase:unavailable"
+    if not path.exists():
+        return "local:missing"
+    stat = path.stat()
+    return f"local:{stat.st_mtime_ns}:{stat.st_size}"
+
+
 def read_cache(path: Path = CACHE_PATH) -> CacheReadResult:
     store = get_supabase_store()
     if store is not None:

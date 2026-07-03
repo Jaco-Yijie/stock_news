@@ -24,7 +24,7 @@ from config_store import (
 from fetcher import SectorResult, deduplicate_news
 from llm_provider import load_llm_verifier_from_env
 from news_store import (
-    cache_backend_name,
+    cache_fingerprint,
     cache_metadata,
     cache_to_display,
     clear_cache,
@@ -513,9 +513,17 @@ def llm_verifier_cache_key(llm_verifier: LLMVerifier | None) -> str:
     )
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
+def get_cache_fingerprint(cache_version: int) -> str:
+    """每分钟最多探测一次数据指纹；后台抓取写入新数据后，
+    指纹变化会自动触发下方展示缓存重新加载。"""
+    return cache_fingerprint()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_display_data(
     cache_version: int,
+    fingerprint: str,
     sectors_config: dict[str, Any],
     external_events: dict[str, Any],
     llm_cache_key: str,
@@ -523,7 +531,7 @@ def load_display_data(
 ):
     """读取缓存并完成重过滤、格式转换、去重。
 
-    整条流水线只在缓存版本或配置变化时重算，
+    整条流水线只在缓存数据、缓存版本或配置变化时重算，
     普通页面交互（筛选、搜索、翻页等）直接复用结果。
     """
     cache_result = read_cache()
@@ -1144,7 +1152,7 @@ def main() -> None:
     st.sidebar.subheader("数据更新")
     if st.sidebar.button("重新加载缓存"):
         st.session_state.cache_version += 1
-    st.sidebar.caption("后台定时抓取更新数据后，点击上方按钮可立即加载最新缓存。")
+    st.sidebar.caption("页面每分钟自动检测后台数据更新；点击上方按钮可立即重新加载。")
 
     if st.sidebar.button("增量刷新"):
         if selected_sectors or show_external_events:
@@ -1234,6 +1242,7 @@ def main() -> None:
         cache_refilter_warnings,
     ) = load_display_data(
         st.session_state.cache_version,
+        get_cache_fingerprint(st.session_state.cache_version),
         sectors_config,
         external_events,
         llm_verifier_cache_key(llm_verifier),
@@ -1241,8 +1250,12 @@ def main() -> None:
     )
     if cache_error:
         st.warning(cache_error + "。页面将显示空缓存，可点击全量刷新重建。")
-    if cache_refilter_warnings:
-        st.warning("；".join(cache_refilter_warnings))
+    # 常规的"已按新规则过滤旧缓存"属于后台正常行为，不展示；只提示真正的失败
+    refilter_failures = [
+        warning for warning in cache_refilter_warnings if "失败" in warning
+    ]
+    if refilter_failures:
+        st.warning("；".join(refilter_failures))
 
     sector_cache_display_df = filter_news_by_time(sector_deduped_df, time_range)
     external_display_df = filter_news_by_time(external_deduped_df, time_range)
@@ -1291,8 +1304,6 @@ def main() -> None:
         added_count=int(st.session_state.last_added_count),
     )
 
-    st.caption(f"缓存后端：{cache_backend_name()}")
-    st.caption(f"缓存更新时间：{latest_cache_at}")
     if raw_cache_display_df.empty:
         st.info("本地缓存暂无新闻。点击左侧“增量刷新”进行首次抓取，或点击“全量刷新”重建缓存。")
     elif sector_cache_display_df.empty and external_display_df.empty:
