@@ -21,6 +21,15 @@ from config_store import (
     try_load_sectors_config,
     update_event_related_sectors,
 )
+from analysis import (
+    IMPACT_LABELS,
+    LOW_CONFIDENCE_REASON,
+    SENTIMENT_LABELS,
+    analyze_display_frame,
+    parse_publish_times,
+    select_hot_news,
+    sentiment_counts,
+)
 from fetcher import SectorResult, deduplicate_news
 from llm_provider import load_llm_verifier_from_env
 from news_store import (
@@ -34,7 +43,7 @@ from news_store import (
 )
 from refresh import run_full_refresh, run_incremental_refresh
 from sectors import SECTORS as DEFAULT_SECTORS
-from time_utils import format_utc8_time
+from time_utils import format_utc8_time, now_utc8_naive
 
 
 st.set_page_config(page_title="A股板块新闻", page_icon="📰", layout="wide")
@@ -401,6 +410,88 @@ def inject_styles() -> None:
             background: #ffffff;
         }
 
+        .tag {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 4px;
+            padding: 1px 8px;
+            font-size: 12px;
+            font-weight: 600;
+            line-height: 1.6;
+            border: 1px solid transparent;
+            white-space: nowrap;
+        }
+
+        .tag-pos { background: #fdeaea; color: #c02b2b; border-color: #f5c6c6; }
+        .tag-neg { background: #e7f4ec; color: #1e7f43; border-color: #c3e5d0; }
+        .tag-neu { background: #eef1f5; color: #5b6675; border-color: #dbe1e8; }
+        .tag-impact-high { background: #fff7e6; color: #b45309; border-color: #fde68a; }
+        .tag-impact-medium { background: #f4f6f8; color: #6b7280; border-color: #e5e7eb; }
+        .tag-impact-low { background: #f9fafb; color: #9ca3af; border-color: #eceff2; }
+        .tag-hot { background: #fff1f0; color: #c0392b; border-color: #fbc4c0; }
+
+        .news-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin: 0 0 6px;
+        }
+
+        .news-reason {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            flex-wrap: wrap;
+            color: #374151;
+            font-size: 13px;
+            margin-top: 7px;
+        }
+
+        .section-title {
+            font-size: 18px;
+            font-weight: 650;
+            color: var(--text);
+            margin: 1.1rem 0 0.15rem;
+        }
+
+        .hot-card {
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--accent);
+            border-radius: 8px;
+            background: var(--surface);
+            padding: 14px 16px;
+            margin-bottom: 0.6rem;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        }
+
+        .hot-title {
+            font-size: 19px;
+            font-weight: 650;
+            color: var(--text);
+            margin: 6px 0 4px;
+            line-height: 1.4;
+            overflow-wrap: anywhere;
+        }
+
+        .hot-sectors {
+            color: #374151;
+            font-size: 13px;
+            margin-top: 3px;
+        }
+
+        .filter-status {
+            margin-top: 0.55rem;
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.8;
+        }
+
+        .filter-status b {
+            color: #374151;
+            font-weight: 600;
+        }
+
         @media (max-width: 900px) {
             .dashboard-header {
                 flex-direction: column;
@@ -549,6 +640,11 @@ def load_display_data(
     external_display_df = deduplicate_display_news(
         display_df[display_df["news_type"].eq("external_event")].reset_index(drop=True)
     )
+    # 利好/利空判断为派生数据，随展示流水线一起缓存，不写入新闻缓存
+    sector_display_df = sector_display_df.copy()
+    sector_display_df["analysis"] = analyze_display_frame(sector_display_df)
+    external_display_df = external_display_df.copy()
+    external_display_df["analysis"] = analyze_display_frame(external_display_df)
     return (
         display_df,
         sector_display_df,
@@ -582,7 +678,7 @@ def filter_news_by_time(news_df: pd.DataFrame, time_range: str) -> pd.DataFrame:
         return news_df.iloc[0:0].reset_index(drop=True)
 
     publish_times = pd.to_datetime(news_df["发布时间"], errors="coerce")
-    now = pd.Timestamp.now()
+    now = pd.Timestamp(now_utc8_naive())
     if time_range == "今天":
         start_at = now.normalize()
     elif time_range == "近 3 天":
@@ -720,27 +816,131 @@ def filter_news(news_df: pd.DataFrame, keyword: str, selected_sources: list[str]
     return filtered_df.reset_index(drop=True)
 
 
-def render_news_item(row: pd.Series) -> str:
+def sentiment_tag_html(
+    sentiment: str,
+    low_confidence: bool = False,
+    divergent: bool = False,
+    prefix: str = "",
+) -> str:
+    css_class = {"positive": "tag-pos", "negative": "tag-neg"}.get(sentiment, "tag-neu")
+    label = SENTIMENT_LABELS.get(sentiment, "中性")
+    if sentiment == "neutral" and divergent:
+        label = "中性｜板块分化"
+    elif sentiment == "neutral" and low_confidence:
+        label = "中性｜判断依据不足"
+    if prefix:
+        label = f"{prefix}·{label}"
+    return f'<span class="tag {css_class}">{escape(label)}</span>'
+
+
+def impact_tag_html(impact_level: str) -> str:
+    label = IMPACT_LABELS.get(impact_level, "低影响")
+    return f'<span class="tag tag-impact-{escape(impact_level)}">{label}</span>'
+
+
+def _row_analysis(row: pd.Series) -> dict[str, Any]:
+    analysis = row.get("analysis")
+    if isinstance(analysis, dict):
+        return analysis
+    return {
+        "sentiment": "neutral",
+        "impact_level": "low",
+        "reason": LOW_CONFIDENCE_REASON,
+        "confidence": 0,
+        "divergent": False,
+        "sector_assessments": {},
+    }
+
+
+def _is_low_confidence(analysis: dict[str, Any]) -> bool:
+    return int(analysis.get("confidence", 0)) < 45
+
+
+def news_tags_html(row: pd.Series, hot_links: set[str] | None = None) -> str:
+    analysis = _row_analysis(row)
+    low_confidence = _is_low_confidence(analysis)
+    tags: list[str] = []
+
+    if str(row.get("news_type", "")) == "external_event":
+        assessments = analysis.get("sector_assessments") or {}
+        shown = 0
+        for sector, assessment in assessments.items():
+            tags.append(
+                sentiment_tag_html(
+                    assessment.get("sentiment", "neutral"),
+                    low_confidence=low_confidence,
+                    prefix=sector,
+                )
+            )
+            shown += 1
+            if shown >= 3:
+                break
+        if not assessments or analysis.get("divergent"):
+            tags.insert(
+                0,
+                sentiment_tag_html(
+                    analysis.get("sentiment", "neutral"),
+                    low_confidence=low_confidence,
+                    divergent=bool(analysis.get("divergent")),
+                ),
+            )
+    else:
+        sector_name = str(row.get("sector", "") or "").strip()
+        assessment = (analysis.get("sector_assessments") or {}).get(sector_name)
+        sentiment = (
+            assessment.get("sentiment") if assessment else analysis.get("sentiment", "neutral")
+        )
+        tags.append(
+            sentiment_tag_html(
+                sentiment,
+                low_confidence=low_confidence,
+                divergent=bool(analysis.get("divergent")),
+            )
+        )
+
+    tags.append(impact_tag_html(analysis.get("impact_level", "low")))
+    link = str(row.get("原文链接", ""))
+    if hot_links and link in hot_links:
+        tags.append('<span class="tag tag-hot">今日热点</span>')
+    return f'<div class="news-tags">{"".join(tags)}</div>'
+
+
+def _row_reason(row: pd.Series) -> str:
+    analysis = _row_analysis(row)
+    if str(row.get("news_type", "")) != "external_event":
+        sector_name = str(row.get("sector", "") or "").strip()
+        assessment = (analysis.get("sector_assessments") or {}).get(sector_name)
+        if assessment:
+            return str(assessment.get("reason", ""))
+    return str(analysis.get("reason", ""))
+
+
+def render_news_item(row: pd.Series, hot_links: set[str] | None = None) -> str:
     title = escape(str(row.get("标题", "")))
     source = escape(str(row.get("来源媒体", "")))
     publish_time = escape(str(row.get("发布时间", "")))
     keyword = escape(str(row.get("匹配关键词", "")))
     link = escape(str(row.get("原文链接", "")), quote=True)
+    reason = escape(_row_reason(row))
 
     return f"""
         <article class="news-card">
             <div class="news-title">{title}</div>
+            {news_tags_html(row, hot_links)}
             <div class="news-meta">
-                <span>来源媒体：{source}</span>
-                <span>发布时间：{publish_time}</span>
+                <span>{source}</span>
+                <span>{publish_time}</span>
                 <span class="keyword-tag">{keyword}</span>
+            </div>
+            <div class="news-reason">
+                <span>判断：{reason}</span>
                 <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">打开原文</a>
             </div>
         </article>
         """
 
 
-def render_external_event_item(row: pd.Series) -> str:
+def render_external_event_item(row: pd.Series, hot_links: set[str] | None = None) -> str:
     title = escape(str(row.get("标题", "")))
     source = escape(str(row.get("来源媒体", "")))
     publish_time = escape(str(row.get("发布时间", "")))
@@ -748,20 +948,87 @@ def render_external_event_item(row: pd.Series) -> str:
     event_category = escape(str(row.get("event_category", "")))
     related_sectors = escape(str(row.get("related_sectors", "") or "未映射"))
     link = escape(str(row.get("原文链接", "")), quote=True)
+    reason = escape(_row_reason(row))
 
     return f"""
         <article class="news-card">
             <div class="news-title">{title}</div>
+            {news_tags_html(row, hot_links)}
             <div class="news-meta">
-                <span>来源媒体：{source}</span>
-                <span>发布时间：{publish_time}</span>
+                <span>{source}</span>
+                <span>{publish_time}</span>
                 <span class="keyword-tag">{event_category}</span>
                 <span class="keyword-tag">{keyword}</span>
                 <span>可能影响板块：{related_sectors}</span>
+            </div>
+            <div class="news-reason">
+                <span>判断：{reason}</span>
                 <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">打开原文</a>
             </div>
         </article>
         """
+
+
+def render_hot_news_item(row: pd.Series) -> str:
+    analysis = _row_analysis(row)
+    title = escape(str(row.get("标题", "")))
+    source = escape(str(row.get("来源媒体", "")))
+    publish_time = escape(str(row.get("发布时间", "")))
+    link = escape(str(row.get("原文链接", "")), quote=True)
+    reason = escape(str(analysis.get("reason", "")))
+    sectors = list((analysis.get("sector_assessments") or {}))
+    sectors_text = escape("、".join(sectors) if sectors else "暂无明确映射")
+
+    tags = (
+        sentiment_tag_html(
+            analysis.get("sentiment", "neutral"),
+            low_confidence=_is_low_confidence(analysis),
+            divergent=bool(analysis.get("divergent")),
+        )
+        + impact_tag_html(analysis.get("impact_level", "low"))
+    )
+
+    return f"""
+        <article class="hot-card">
+            <div class="news-tags">{tags}</div>
+            <div class="hot-title">{title}</div>
+            <div class="news-meta">
+                <span>来源：{source}</span>
+                <span>{publish_time}</span>
+            </div>
+            <div class="hot-sectors">影响板块：{sectors_text}</div>
+            <div class="news-reason">
+                <span>判断：{reason}</span>
+                <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">查看原文</a>
+            </div>
+        </article>
+        """
+
+
+def show_hot_news_section(hot_df: pd.DataFrame, used_fallback: bool) -> None:
+    st.markdown('<div class="section-title">今日热点新闻</div>', unsafe_allow_html=True)
+    if hot_df is None or hot_df.empty:
+        st.info("今日暂无足够高相关度的热点新闻。可以尝试刷新数据或选择更多板块。")
+        return
+    if used_fallback:
+        st.caption("今日高相关热点不足，已补充最近 24 小时的重要新闻。")
+    cards = "".join(render_hot_news_item(row) for _, row in hot_df.iterrows())
+    st.markdown(cards, unsafe_allow_html=True)
+
+
+def sentiment_pills_html(analyses) -> str:
+    counts = sentiment_counts(analyses)
+    return (
+        f'<span class="pill">利好 {counts["positive"]}</span>'
+        f'<span class="pill">中性 {counts["neutral"]}</span>'
+        f'<span class="pill">利空 {counts["negative"]}</span>'
+    )
+
+
+EMPTY_FILTER_HINT = (
+    '<div class="empty-state">当前筛选条件下暂无相关新闻。'
+    "可以尝试扩大时间范围或选择更多板块。</div>"
+)
 
 
 def show_sector_section(
@@ -770,9 +1037,9 @@ def show_sector_section(
     keyword: str,
     selected_sources: list[str],
     max_items: int,
+    hot_links: set[str] | None = None,
 ) -> None:
     filtered_df = filter_news(result.data, keyword, selected_sources)
-    warning_count = len(result.warnings) + (1 if result.error else 0)
     warning_html = ""
     if result.warnings:
         warning_html += (
@@ -786,22 +1053,27 @@ def show_sector_section(
     if result.error:
         body_html = warning_html
     elif filtered_df.empty:
-        body_html = warning_html + '<div class="empty-state">当前筛选条件下暂无新闻。</div>'
+        body_html = warning_html + EMPTY_FILTER_HINT
     else:
         news_html = "".join(
-            render_news_item(row) for _, row in filtered_df.head(max_items).iterrows()
+            render_news_item(row, hot_links)
+            for _, row in filtered_df.head(max_items).iterrows()
         )
         body_html = warning_html + f'<div class="news-list">{news_html}</div>'
 
+    sentiment_pills = (
+        sentiment_pills_html(filtered_df["analysis"])
+        if "analysis" in filtered_df.columns
+        else ""
+    )
     st.markdown(
         f"""
         <section class="sector-section">
             <div class="sector-heading">
-                <div class="sector-name">{escape(sector)}</div>
+                <div class="sector-name">{escape(sector)}相关新闻</div>
                 <div class="sector-meta">
-                    <span class="pill">去重后 {len(result.data)} 条</span>
-                    <span class="pill">当前显示 {len(filtered_df)} 条</span>
-                    <span class="pill warn">warning {warning_count}</span>
+                    <span class="pill">共 {len(filtered_df)} 条</span>
+                    {sentiment_pills}
                 </div>
             </div>
             {body_html}
@@ -817,6 +1089,7 @@ def show_external_events_section(
     keyword: str,
     selected_sources: list[str],
     max_items: int,
+    hot_links: set[str] | None = None,
 ) -> None:
     filtered_df = filter_news(external_df, keyword, selected_sources)
     warning_items = [
@@ -833,23 +1106,27 @@ def show_external_events_section(
         )
 
     if filtered_df.empty:
-        body_html = warning_html + '<div class="empty-state">当前筛选条件下暂无外部事件新闻。</div>'
+        body_html = warning_html + EMPTY_FILTER_HINT
     else:
         news_html = "".join(
-            render_external_event_item(row)
+            render_external_event_item(row, hot_links)
             for _, row in filtered_df.head(max_items).iterrows()
         )
         body_html = warning_html + f'<div class="news-list">{news_html}</div>'
 
+    sentiment_pills = (
+        sentiment_pills_html(filtered_df["analysis"])
+        if "analysis" in filtered_df.columns
+        else ""
+    )
     st.markdown(
         f"""
         <section class="sector-section">
             <div class="sector-heading">
-                <div class="sector-name">外部事件</div>
+                <div class="sector-name">外部宏观风险事件</div>
                 <div class="sector-meta">
-                    <span class="pill">去重后 {len(external_df)} 条</span>
-                    <span class="pill">当前显示 {len(filtered_df)} 条</span>
-                    <span class="pill warn">warning {len(warning_items)}</span>
+                    <span class="pill">共 {len(filtered_df)} 条</span>
+                    {sentiment_pills}
                 </div>
             </div>
             {body_html}
@@ -860,39 +1137,51 @@ def show_external_events_section(
 
 
 def render_dashboard_header(
-    selected_count: int,
-    displayed_total: int,
-    cache_total: int,
     latest_cache_at: str,
-    added_count: int,
+    selected_sectors: list[str],
+    filter_summary: str,
+    today_total: int,
+    hot_count: int,
+    today_counts: dict[str, int],
 ) -> None:
+    if selected_sectors:
+        shown = "、".join(selected_sectors[:3])
+        if len(selected_sectors) > 3:
+            shown += f" 等 {len(selected_sectors)} 个板块"
+    else:
+        shown = "未选择板块"
+
     st.markdown(
         f"""
         <section class="dashboard-header">
             <div>
                 <div class="dashboard-title">A股板块新闻</div>
-                <div class="dashboard-subtitle">按板块聚合东方财富新闻，支持筛选与去重</div>
+                <div class="dashboard-subtitle">按板块聚合市场新闻，识别可能受影响的行业与事件方向</div>
+                <div class="filter-status">
+                    数据更新：<b>{escape(latest_cache_at)}</b><br>
+                    当前关注：<b>{escape(shown)}</b> ｜ 筛选：{escape(filter_summary)}
+                </div>
             </div>
             <div class="metric-grid">
                 <div class="metric-card">
-                    <div class="metric-label">覆盖板块数</div>
-                    <div class="metric-value">{selected_count}</div>
+                    <div class="metric-label">今日新闻</div>
+                    <div class="metric-value">{today_total}</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-label">缓存新闻总数</div>
-                    <div class="metric-value">{cache_total}</div>
+                    <div class="metric-label">今日热点</div>
+                    <div class="metric-value">{hot_count}</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-label">当前新闻数</div>
-                    <div class="metric-value">{displayed_total}</div>
+                    <div class="metric-label">利好</div>
+                    <div class="metric-value">{today_counts.get("positive", 0)}</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-label">本次新增</div>
-                    <div class="metric-value">{added_count}</div>
+                    <div class="metric-label">中性</div>
+                    <div class="metric-value">{today_counts.get("neutral", 0)}</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-label">最近缓存更新</div>
-                    <div class="metric-value">{escape(latest_cache_at)}</div>
+                    <div class="metric-label">利空</div>
+                    <div class="metric-value">{today_counts.get("negative", 0)}</div>
                 </div>
             </div>
         </section>
@@ -912,7 +1201,7 @@ def show_config_notice() -> None:
 
 
 def render_sector_config_manager(sectors_config: dict[str, Any]) -> None:
-    with st.sidebar.expander("关键词管理", expanded=False):
+    with st.container():
         sector_options = list(sectors_config)
         if not sector_options:
             st.info("暂无板块配置。")
@@ -998,7 +1287,7 @@ def render_event_config_manager(
     event_to_sectors: dict[str, list[str]],
     sectors_config: dict[str, Any],
 ) -> None:
-    with st.sidebar.expander("外部事件管理", expanded=False):
+    with st.container():
         event_options = list(external_events)
         if not event_options:
             st.info("暂无外部事件配置。")
@@ -1085,76 +1374,48 @@ def render_event_config_manager(
                 st.warning("请先勾选确认项。")
 
 
-def main() -> None:
-    inject_styles()
+FILTER_STATE_DEFAULTS: dict[str, Any] = {
+    "sector_query": "",
+    "display_scope": "全部",
+    "time_range": "全部",
+    "keyword_search": "",
+    "max_items": 30,
+    "source_filter": [],
+}
 
-    if "cache_version" not in st.session_state:
-        st.session_state.cache_version = 0
-    if "last_added_count" not in st.session_state:
-        st.session_state.last_added_count = 0
-    if "last_sector_warnings" not in st.session_state:
-        st.session_state.last_sector_warnings = {}
-    if "last_external_warnings" not in st.session_state:
-        st.session_state.last_external_warnings = {}
 
-    sectors_config, sectors_config_error = try_load_sectors_config()
-    events_config, events_config_error = try_load_events_config()
-    external_events = events_config["external_events"]
-    event_to_sectors = events_config["event_to_sectors"]
-    llm_verifier, llm_notice = get_llm_verifier()
-
+def reset_all_filters(sectors_config: dict[str, Any]) -> None:
     for sector in sectors_config:
-        st.session_state.setdefault(
-            f"sector_selected::{sector}",
-            sector in DEFAULT_SELECTED_SECTORS,
+        st.session_state[f"sector_selected::{sector}"] = sector in DEFAULT_SELECTED_SECTORS
+    for key, value in FILTER_STATE_DEFAULTS.items():
+        st.session_state[key] = value
+
+
+def _record_refresh_status(added_count: int) -> None:
+    st.session_state.last_added_count = added_count
+    st.session_state.last_refresh_at = now_utc8_naive().strftime("%H:%M")
+
+
+def render_data_refresh_controls(
+    selected_sectors: list[str],
+    sectors_config: dict[str, Any],
+    external_events: dict[str, list[Any]],
+    event_to_sectors: dict[str, list[str]],
+    llm_verifier: LLMVerifier | None,
+    show_external_events: bool,
+) -> None:
+    if st.button("重新加载缓存"):
+        st.session_state.cache_version += 1
+    st.caption("页面每分钟自动检测后台数据更新；点击可立即重新加载。")
+
+    last_refresh_at = st.session_state.get("last_refresh_at", "")
+    if last_refresh_at:
+        st.caption(
+            f"已成功更新 {int(st.session_state.get('last_added_count', 0))} 条新闻 ｜ "
+            f"最近刷新时间：{last_refresh_at}"
         )
 
-    st.sidebar.header("筛选")
-    show_config_notice()
-    if sectors_config_error:
-        st.sidebar.warning(sectors_config_error)
-    if events_config_error:
-        st.sidebar.warning(events_config_error)
-
-    sector_query = st.sidebar.text_input("板块搜索", placeholder="输入板块或关键词")
-    select_col, clear_col = st.sidebar.columns(2)
-    if select_col.button("全选"):
-        for sector in sectors_config:
-            st.session_state[f"sector_selected::{sector}"] = True
-    if clear_col.button("清空"):
-        for sector in sectors_config:
-            st.session_state[f"sector_selected::{sector}"] = False
-
-    render_sector_selector(sectors_config, sector_query)
-
-    selected_sectors = [
-        sector
-        for sector in sectors_config
-        if st.session_state.get(f"sector_selected::{sector}", False)
-    ]
-    display_scope = st.sidebar.radio(
-        "新闻类型",
-        options=["全部", "板块新闻", "外部事件"],
-    )
-    show_sector_news = display_scope in ("全部", "板块新闻")
-    show_external_events = display_scope in ("全部", "外部事件")
-    time_range = st.sidebar.radio("时间范围", options=TIME_RANGE_OPTIONS)
-    if llm_notice:
-        st.sidebar.warning(llm_notice)
-    keyword = st.sidebar.text_input("关键词搜索", placeholder="标题、命中关键词、来源媒体")
-    max_items = st.sidebar.slider("每个板块最多展示条数", min_value=5, max_value=100, value=30)
-
-    st.sidebar.divider()
-    render_sector_config_manager(sectors_config)
-    render_event_config_manager(external_events, event_to_sectors, sectors_config)
-
-    st.sidebar.divider()
-    st.sidebar.subheader("数据更新")
-    if st.sidebar.button("重新加载缓存"):
-        st.session_state.cache_version += 1
-    st.sidebar.caption("页面每分钟自动检测后台数据更新；点击上方按钮可立即重新加载。")
-
-    if st.sidebar.button("增量刷新"):
+    if st.button("增量刷新"):
         if selected_sectors or show_external_events:
             with st.spinner("正在增量抓取新新闻，并合并到缓存..."):
                 outcome = run_incremental_refresh(
@@ -1174,15 +1435,15 @@ def main() -> None:
                 except Exception as exc:
                     st.error(f"缓存保存失败，本次抓取结果未持久化：{exc}")
                 else:
-                    st.session_state.last_added_count = outcome.added_count
+                    _record_refresh_status(outcome.added_count)
                     st.session_state.last_sector_warnings = outcome.sector_warnings
                     st.session_state.last_external_warnings = outcome.event_warnings
                     st.session_state.cache_version += 1
-                    st.success(f"增量刷新完成，新增 {outcome.added_count} 条新闻。")
+                    st.success(f"已成功更新 {outcome.added_count} 条新闻。")
         else:
-            st.sidebar.warning("请至少选择一个板块，或切换为显示外部事件后再刷新。")
+            st.warning("请至少选择一个板块，或切换为显示外部事件后再刷新。")
 
-    if st.sidebar.button("全量刷新"):
+    if st.button("全量刷新"):
         if selected_sectors or show_external_events:
             with st.spinner("正在全量抓取所选板块，并重建缓存..."):
                 outcome = run_full_refresh(
@@ -1203,18 +1464,17 @@ def main() -> None:
                     except Exception as exc:
                         st.error(f"缓存保存失败，本次抓取结果未持久化：{exc}")
                     else:
-                        st.session_state.last_added_count = outcome.added_count
+                        _record_refresh_status(outcome.added_count)
                         st.session_state.last_sector_warnings = outcome.sector_warnings
                         st.session_state.last_external_warnings = outcome.event_warnings
                         st.session_state.cache_version += 1
-                        st.success(
-                            f"全量刷新完成，缓存已重建为 {outcome.added_count} 条新闻。"
-                        )
+                        st.success(f"全量刷新完成，缓存已重建为 {outcome.added_count} 条新闻。")
         else:
-            st.sidebar.warning("请至少选择一个板块，或切换为显示外部事件后再全量刷新。")
+            st.warning("请至少选择一个板块，或切换为显示外部事件后再全量刷新。")
 
-    confirm_clear_cache = st.sidebar.checkbox("确认要清空本地缓存")
-    if st.sidebar.button("确认清空本地缓存"):
+    st.divider()
+    confirm_clear_cache = st.checkbox("确认要清空缓存", key="confirm_clear_cache")
+    if st.button("清空缓存"):
         if confirm_clear_cache:
             try:
                 clear_cache()
@@ -1227,7 +1487,101 @@ def main() -> None:
                 st.session_state.cache_version += 1
                 st.warning("缓存已清空。")
         else:
-            st.sidebar.warning("请先勾选确认项，避免误清空缓存。")
+            st.warning("请先勾选确认项，避免误清空缓存。")
+
+
+def main() -> None:
+    inject_styles()
+
+    if "cache_version" not in st.session_state:
+        st.session_state.cache_version = 0
+    if "last_added_count" not in st.session_state:
+        st.session_state.last_added_count = 0
+    if "last_sector_warnings" not in st.session_state:
+        st.session_state.last_sector_warnings = {}
+    if "last_external_warnings" not in st.session_state:
+        st.session_state.last_external_warnings = {}
+    for state_key, state_value in FILTER_STATE_DEFAULTS.items():
+        st.session_state.setdefault(state_key, state_value)
+
+    sectors_config, sectors_config_error = try_load_sectors_config()
+    events_config, events_config_error = try_load_events_config()
+    external_events = events_config["external_events"]
+    event_to_sectors = events_config["event_to_sectors"]
+    llm_verifier, llm_notice = get_llm_verifier()
+
+    for sector in sectors_config:
+        st.session_state.setdefault(
+            f"sector_selected::{sector}",
+            sector in DEFAULT_SELECTED_SECTORS,
+        )
+
+    st.sidebar.header("筛选")
+    show_config_notice()
+    if sectors_config_error:
+        st.sidebar.warning(sectors_config_error)
+    if events_config_error:
+        st.sidebar.warning(events_config_error)
+
+    if st.sidebar.button("清除全部筛选"):
+        reset_all_filters(sectors_config)
+
+    sector_query = st.sidebar.text_input(
+        "板块搜索", placeholder="输入板块或关键词", key="sector_query"
+    )
+    select_col, clear_col = st.sidebar.columns(2)
+    if select_col.button("全选"):
+        for sector in sectors_config:
+            st.session_state[f"sector_selected::{sector}"] = True
+    if clear_col.button("清空"):
+        for sector in sectors_config:
+            st.session_state[f"sector_selected::{sector}"] = False
+
+    render_sector_selector(sectors_config, sector_query)
+
+    selected_sectors = [
+        sector
+        for sector in sectors_config
+        if st.session_state.get(f"sector_selected::{sector}", False)
+    ]
+    if selected_sectors:
+        st.sidebar.markdown("**当前已选：**" + "、".join(selected_sectors))
+    else:
+        st.sidebar.caption("尚未选择板块")
+
+    display_scope = st.sidebar.radio(
+        "新闻类型",
+        options=["全部", "板块新闻", "外部事件"],
+        key="display_scope",
+    )
+    show_sector_news = display_scope in ("全部", "板块新闻")
+    show_external_events = display_scope in ("全部", "外部事件")
+    time_range = st.sidebar.radio("时间范围", options=TIME_RANGE_OPTIONS, key="time_range")
+    if llm_notice:
+        st.sidebar.warning(llm_notice)
+    keyword = st.sidebar.text_input(
+        "关键词搜索", placeholder="标题、命中关键词、来源媒体", key="keyword_search"
+    )
+    max_items = st.sidebar.slider(
+        "每个板块最多展示条数", min_value=5, max_value=100, key="max_items"
+    )
+
+    st.sidebar.divider()
+    with st.sidebar.expander("数据管理与高级设置", expanded=False):
+        keyword_tab, event_tab, data_tab = st.tabs(["关键词管理", "外部事件", "数据刷新"])
+        with keyword_tab:
+            render_sector_config_manager(sectors_config)
+        with event_tab:
+            render_event_config_manager(external_events, event_to_sectors, sectors_config)
+        with data_tab:
+            render_data_refresh_controls(
+                selected_sectors,
+                sectors_config,
+                external_events,
+                event_to_sectors,
+                llm_verifier,
+                show_external_events,
+            )
 
     if show_sector_news and not selected_sectors and not show_external_events:
         st.info("请至少选择一个板块。")
@@ -1274,7 +1628,15 @@ def main() -> None:
         else pd.DataFrame()
     )
     available_sources = collect_sources(source_df)
-    selected_sources = st.sidebar.multiselect("来源媒体", options=available_sources)
+    st.session_state.source_filter = [
+        source
+        for source in st.session_state.get("source_filter", [])
+        if source in available_sources
+    ]
+    selected_sources = st.sidebar.multiselect(
+        "来源媒体", options=available_sources, key="source_filter"
+    )
+    st.sidebar.caption(f"缓存共 {int(metadata['total'])} 条新闻")
 
     results: dict[str, SectorResult] = {}
     warnings_by_sector = st.session_state.get("last_sector_warnings", {})
@@ -1287,36 +1649,68 @@ def main() -> None:
             warnings=tuple(warnings_by_sector.get(sector, [])),
         )
 
-    displayed_total = 0
-    for sector in selected_sectors if show_sector_news else []:
-        filtered_df = filter_news(results[sector].data, keyword, selected_sources)
-        displayed_total += min(len(filtered_df), max_items)
+    # 今日热点：从去重后的全部新闻中选取，不受时间范围筛选影响
+    hot_pool_frames: list[pd.DataFrame] = []
+    if show_sector_news:
+        hot_pool_frames.append(sector_deduped_df)
     if show_external_events:
-        filtered_external_df = filter_news(external_display_df, keyword, selected_sources)
-        displayed_total += min(len(filtered_external_df), max_items)
+        hot_pool_frames.append(external_deduped_df)
+    hot_pool_df = (
+        pd.concat(hot_pool_frames, ignore_index=True)
+        if hot_pool_frames
+        else pd.DataFrame()
+    )
+    hot_df, hot_used_fallback = select_hot_news(hot_pool_df, selected_sectors)
+    hot_links = (
+        set(hot_df["原文链接"].astype(str)) if not hot_df.empty else set()
+    )
+
+    # 今日新闻统计：当前关注范围内、发布日期为今天（UTC+8）的新闻
+    today_scope_frames: list[pd.DataFrame] = []
+    if show_sector_news and selected_sectors:
+        today_scope_frames.append(
+            sector_deduped_df[sector_deduped_df["sector"].isin(selected_sectors)]
+        )
+    if show_external_events:
+        today_scope_frames.append(external_deduped_df)
+    today_counts = {"positive": 0, "neutral": 0, "negative": 0}
+    today_total = 0
+    if today_scope_frames:
+        today_scope_df = pd.concat(today_scope_frames, ignore_index=True)
+        publish_times = parse_publish_times(today_scope_df)
+        today_mask = publish_times.dt.date.eq(now_utc8_naive().date()).fillna(False)
+        today_df = today_scope_df[today_mask]
+        today_total = len(today_df)
+        if "analysis" in today_df.columns:
+            today_counts = sentiment_counts(today_df["analysis"])
+
+    filter_parts: list[str] = []
+    if time_range != "全部":
+        filter_parts.append(f"时间 {time_range}")
+    if display_scope != "全部":
+        filter_parts.append(f"类型 {display_scope}")
+    if keyword:
+        filter_parts.append(f"关键词“{keyword}”")
+    if selected_sources:
+        filter_parts.append(f"来源 {len(selected_sources)} 个")
+    filter_summary = " · ".join(filter_parts) if filter_parts else "默认（全部时间 · 全部类型）"
 
     latest_cache_at = format_utc8_time(metadata["latest_fetched_at"])
     render_dashboard_header(
-        selected_count=len(selected_sectors),
-        displayed_total=displayed_total,
-        cache_total=int(metadata["total"]),
         latest_cache_at=latest_cache_at,
-        added_count=int(st.session_state.last_added_count),
+        selected_sectors=selected_sectors,
+        filter_summary=filter_summary,
+        today_total=today_total,
+        hot_count=len(hot_df),
+        today_counts=today_counts,
     )
 
     if raw_cache_display_df.empty:
-        st.info("本地缓存暂无新闻。点击左侧“增量刷新”进行首次抓取，或点击“全量刷新”重建缓存。")
+        st.info("缓存暂无新闻。后台任务会定时抓取，也可以在“数据管理与高级设置”中手动刷新。")
     elif sector_cache_display_df.empty and external_display_df.empty:
-        st.info("当前时间范围下暂无新闻。")
+        st.info("当前时间范围下暂无新闻。可以尝试扩大时间范围或选择更多板块。")
 
-    if show_external_events:
-        show_external_events_section(
-            external_display_df,
-            st.session_state.get("last_external_warnings", {}),
-            keyword,
-            selected_sources,
-            max_items,
-        )
+    show_hot_news_section(hot_df, hot_used_fallback)
 
     if show_sector_news:
         if not selected_sectors:
@@ -1328,7 +1722,18 @@ def main() -> None:
                 keyword,
                 selected_sources,
                 max_items,
+                hot_links,
             )
+
+    if show_external_events:
+        show_external_events_section(
+            external_display_df,
+            st.session_state.get("last_external_warnings", {}),
+            keyword,
+            selected_sources,
+            max_items,
+            hot_links,
+        )
 
 
 if __name__ == "__main__":
