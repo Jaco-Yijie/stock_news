@@ -12,6 +12,11 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def now_utc8_naive() -> datetime:
+    """当前北京时间（去掉时区信息，便于与新闻发布时间直接比较）。"""
+    return datetime.now(UTC8).replace(tzinfo=None)
+
+
 def _parse_time(value: Any) -> datetime | None:
     if value is None:
         return None
