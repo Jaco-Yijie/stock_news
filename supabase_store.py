@@ -117,6 +117,20 @@ class SupabaseNewsStore:
     def fetch_all(self) -> list[dict[str, Any]]:
         return self._fetch_paged("*")
 
+    def latest_fetched_at(self) -> str:
+        response = self._request(
+            "GET",
+            params={
+                "select": "fetched_at",
+                "order": "fetched_at.desc",
+                "limit": "1",
+            },
+        )
+        rows = response.json()
+        if isinstance(rows, list) and rows:
+            return str(rows[0].get("fetched_at", ""))
+        return ""
+
     def fetch_ids(self) -> set[str]:
         return {
             str(row.get("id", ""))
