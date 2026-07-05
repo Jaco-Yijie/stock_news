@@ -7,7 +7,12 @@ from typing import Any, Iterable
 import pandas as pd
 
 from classifier import LLMValidationCache, LLMVerifier
-from fetcher import deduplicate_news, filter_external_event_news, high_risk_sector_rules
+from fetcher import (
+    _normalize_link_for_dedupe,
+    deduplicate_news,
+    filter_external_event_news,
+    high_risk_sector_rules,
+)
 from paths import DATA_DIR
 from supabase_store import SupabaseNewsStore, load_supabase_credentials
 from time_utils import utc_now_iso
@@ -384,54 +389,30 @@ def deduplicate_cache(df: pd.DataFrame) -> pd.DataFrame:
     return combine_cache_frames(deduped_frames)
 
 
-def _incremental_group_key(row: pd.Series) -> str:
-    news_type = str(row.get("news_type", "sector_news") or "sector_news")
-    if news_type == "external_event":
-        category = str(row.get("event_category", "") or "未分类")
-        return f"{news_type}:{category}"
-    sector = str(row.get("sector", "") or "未分类")
-    return f"{news_type}:{sector}"
-
-
 def filter_incremental_news(
     existing_cache: pd.DataFrame,
     fetched_cache: pd.DataFrame,
 ) -> pd.DataFrame:
+    """按链接判重挑出新增新闻。
+
+    以前按"组内最新发布时间"截断，上游返回乱序时会漏掉新闻；
+    链接判重不依赖时间顺序。没有链接的行保守保留，交给后续去重处理。
+    """
     existing = _normalize_cache_frame(existing_cache)
     fetched = _normalize_cache_frame(fetched_cache)
-    if fetched.empty:
-        return fetched
-    if existing.empty:
+    if fetched.empty or existing.empty:
         return fetched
 
-    existing_with_time = existing.copy()
-    existing_with_time["_publish_dt"] = pd.to_datetime(
-        existing_with_time["publish_time"], errors="coerce"
-    )
-    existing_with_time["_incremental_group"] = existing_with_time.apply(
-        _incremental_group_key, axis=1
-    )
-    latest_by_group = existing_with_time.groupby("_incremental_group")["_publish_dt"].max()
-
-    fetched_with_time = fetched.copy()
-    fetched_with_time["_publish_dt"] = pd.to_datetime(
-        fetched_with_time["publish_time"], errors="coerce"
-    )
-    fetched_with_time["_incremental_group"] = fetched_with_time.apply(
-        _incremental_group_key, axis=1
-    )
-
-    keep_mask = []
-    for _, row in fetched_with_time.iterrows():
-        publish_dt = row["_publish_dt"]
-        latest_dt = latest_by_group.get(row["_incremental_group"], pd.NaT)
-        if pd.isna(publish_dt) or pd.isna(latest_dt):
-            keep_mask.append(True)
-        else:
-            keep_mask.append(publish_dt > latest_dt)
-
-    kept = fetched_with_time[keep_mask].drop(columns=["_publish_dt", "_incremental_group"])
-    return _normalize_cache_frame(kept)
+    existing_links = {
+        normalized
+        for link in existing["link"]
+        if (normalized := _normalize_link_for_dedupe(link))
+    }
+    keep_mask = [
+        not (normalized := _normalize_link_for_dedupe(link)) or normalized not in existing_links
+        for link in fetched["link"]
+    ]
+    return _normalize_cache_frame(fetched[keep_mask])
 
 
 def merge_cache(

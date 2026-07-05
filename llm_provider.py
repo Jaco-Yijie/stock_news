@@ -97,6 +97,33 @@ class ChatCompletionsLLMVerifier:
         )
         return parse_llm_validation(content)
 
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        """通用文本生成（用于日报归纳等场景，不强制 JSON 输出）。"""
+        if self.provider == "doubao" and "/responses" in self.endpoint.casefold():
+            payload = {
+                "model": self.model,
+                "input": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+            return _extract_responses_content(self._post_json(payload))
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.3,
+        }
+        data = self._post_json(payload)
+        return (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self._post(
             self.endpoint,

@@ -26,10 +26,14 @@ from analysis import (
     LOW_CONFIDENCE_REASON,
     SENTIMENT_LABELS,
     analyze_display_frame,
+    group_similar_news,
     parse_publish_times,
     select_hot_news,
     sentiment_counts,
+    sort_news_by_importance,
 )
+from analysis_rules import CATEGORY_LABELS
+from digest import build_digest_records, generate_sector_digest
 from fetcher import SectorResult, deduplicate_news
 from llm_provider import load_llm_verifier_from_env
 from news_store import (
@@ -429,6 +433,38 @@ def inject_styles() -> None:
         .tag-impact-medium { background: #f4f6f8; color: #6b7280; border-color: #e5e7eb; }
         .tag-impact-low { background: #f9fafb; color: #9ca3af; border-color: #eceff2; }
         .tag-hot { background: #fff1f0; color: #c0392b; border-color: #fbc4c0; }
+        .tag-cat-policy { background: #eff6ff; color: #1d4ed8; border-color: #dbeafe; }
+        .tag-cat-stock_move { background: #f9fafb; color: #9ca3af; border-color: #eceff2; }
+
+        details.related-reports {
+            margin-top: 6px;
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        details.related-reports summary {
+            cursor: pointer;
+            color: var(--accent);
+            font-weight: 500;
+        }
+
+        .related-item {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            padding: 4px 0 0 12px;
+            color: var(--muted);
+        }
+
+        .related-item a {
+            color: #374151 !important;
+            text-decoration: none !important;
+        }
+
+        .related-item a:hover {
+            color: var(--accent) !important;
+            text-decoration: underline !important;
+        }
 
         .news-tags {
             display: flex;
@@ -899,6 +935,11 @@ def news_tags_html(row: pd.Series, hot_links: set[str] | None = None) -> str:
         )
 
     tags.append(impact_tag_html(analysis.get("impact_level", "low")))
+    category = str(analysis.get("category", "general"))
+    if category in ("policy", "stock_move"):
+        tags.append(
+            f'<span class="tag tag-cat-{category}">{CATEGORY_LABELS.get(category, "")}</span>'
+        )
     link = str(row.get("原文链接", ""))
     if hot_links and link in hot_links:
         tags.append('<span class="tag tag-hot">今日热点</span>')
@@ -915,7 +956,33 @@ def _row_reason(row: pd.Series) -> str:
     return str(analysis.get("reason", ""))
 
 
-def render_news_item(row: pd.Series, hot_links: set[str] | None = None) -> str:
+def related_reports_html(related_rows: list[pd.Series]) -> str:
+    if not related_rows:
+        return ""
+    items = []
+    for row in related_rows[:8]:
+        title = escape(str(row.get("标题", "")))
+        source = escape(str(row.get("来源媒体", "")))
+        publish_time = escape(str(row.get("发布时间", "")))
+        link = escape(str(row.get("原文链接", "")), quote=True)
+        items.append(
+            f'<div class="related-item">'
+            f'<a href="{link}" target="_blank" rel="noopener noreferrer">{title}</a>'
+            f"<span>{source} · {publish_time}</span></div>"
+        )
+    return (
+        f'<details class="related-reports">'
+        f"<summary>另有 {len(related_rows)} 条相关报道</summary>"
+        + "".join(items)
+        + "</details>"
+    )
+
+
+def render_news_item(
+    row: pd.Series,
+    hot_links: set[str] | None = None,
+    related_rows: list[pd.Series] | None = None,
+) -> str:
     title = escape(str(row.get("标题", "")))
     source = escape(str(row.get("来源媒体", "")))
     publish_time = escape(str(row.get("发布时间", "")))
@@ -936,11 +1003,16 @@ def render_news_item(row: pd.Series, hot_links: set[str] | None = None) -> str:
                 <span>判断：{reason}</span>
                 <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">打开原文</a>
             </div>
+            {related_reports_html(related_rows or [])}
         </article>
         """
 
 
-def render_external_event_item(row: pd.Series, hot_links: set[str] | None = None) -> str:
+def render_external_event_item(
+    row: pd.Series,
+    hot_links: set[str] | None = None,
+    related_rows: list[pd.Series] | None = None,
+) -> str:
     title = escape(str(row.get("标题", "")))
     source = escape(str(row.get("来源媒体", "")))
     publish_time = escape(str(row.get("发布时间", "")))
@@ -965,6 +1037,7 @@ def render_external_event_item(row: pd.Series, hot_links: set[str] | None = None
                 <span>判断：{reason}</span>
                 <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">打开原文</a>
             </div>
+            {related_reports_html(related_rows or [])}
         </article>
         """
 
@@ -1003,6 +1076,75 @@ def render_hot_news_item(row: pd.Series) -> str:
             </div>
         </article>
         """
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def cached_sector_digest(
+    digest_date: str,
+    sector: str,
+    records: list[dict[str, str]],
+    llm_cache_key: str,
+    _llm_verifier: LLMVerifier | None,
+) -> str:
+    return generate_sector_digest(_llm_verifier, sector, records)
+
+
+MAX_DIGEST_SECTORS = 5
+
+
+def render_daily_digest_section(
+    llm_verifier: LLMVerifier | None,
+    selected_sectors: list[str],
+    sector_deduped_df: pd.DataFrame,
+) -> None:
+    with st.expander("今日板块日报（LLM 生成）", expanded=False):
+        if llm_verifier is None:
+            st.info(
+                "未配置 LLM，无法生成日报。在环境变量或 Secrets 中配置 "
+                "LLM_VERIFY_PROVIDER 及豆包 / DeepSeek 密钥后可用。"
+            )
+            return
+        if not selected_sectors:
+            st.info("请先选择板块。")
+            return
+
+        if st.button("生成 / 更新今日日报", key="generate_digest"):
+            st.session_state.digest_requested = True
+        if not st.session_state.get("digest_requested"):
+            st.caption(
+                f"点击按钮按板块归纳今天的新闻（最多 {MAX_DIGEST_SECTORS} 个板块，"
+                "结果缓存 6 小时）。"
+            )
+            return
+
+        today = now_utc8_naive().date()
+        publish_times = parse_publish_times(sector_deduped_df)
+        today_df = sector_deduped_df[publish_times.dt.date.eq(today).fillna(False)]
+
+        for sector in selected_sectors[:MAX_DIGEST_SECTORS]:
+            sector_df = today_df[today_df["sector"] == sector]
+            if sector_df.empty:
+                st.markdown(f"**{sector}**：今日暂无相关新闻。")
+                continue
+            records = build_digest_records(sort_news_by_importance(sector_df))
+            try:
+                with st.spinner(f"正在归纳「{sector}」..."):
+                    digest_text = cached_sector_digest(
+                        str(today),
+                        sector,
+                        records,
+                        llm_verifier_cache_key(llm_verifier),
+                        llm_verifier,
+                    )
+            except Exception as exc:
+                st.warning(f"「{sector}」日报生成失败：{exc}")
+                continue
+            if digest_text:
+                st.markdown(f"**{sector}**：{digest_text}")
+            else:
+                st.markdown(f"**{sector}**：LLM 未返回有效内容。")
+        if len(selected_sectors) > MAX_DIGEST_SECTORS:
+            st.caption(f"已选板块较多，仅生成前 {MAX_DIGEST_SECTORS} 个板块的日报以控制成本。")
 
 
 def show_hot_news_section(hot_df: pd.DataFrame, used_fallback: bool) -> None:
@@ -1055,9 +1197,15 @@ def show_sector_section(
     elif filtered_df.empty:
         body_html = warning_html + EMPTY_FILTER_HINT
     else:
+        sorted_df = sort_news_by_importance(filtered_df)
+        clusters = group_similar_news(sorted_df.head(max_items * 3))
         news_html = "".join(
-            render_news_item(row, hot_links)
-            for _, row in filtered_df.head(max_items).iterrows()
+            render_news_item(
+                sorted_df.iloc[primary],
+                hot_links,
+                [sorted_df.iloc[position] for position in related],
+            )
+            for primary, related in clusters[:max_items]
         )
         body_html = warning_html + f'<div class="news-list">{news_html}</div>'
 
@@ -1108,9 +1256,15 @@ def show_external_events_section(
     if filtered_df.empty:
         body_html = warning_html + EMPTY_FILTER_HINT
     else:
+        sorted_df = sort_news_by_importance(filtered_df)
+        clusters = group_similar_news(sorted_df.head(max_items * 3))
         news_html = "".join(
-            render_external_event_item(row, hot_links)
-            for _, row in filtered_df.head(max_items).iterrows()
+            render_external_event_item(
+                sorted_df.iloc[primary],
+                hot_links,
+                [sorted_df.iloc[position] for position in related],
+            )
+            for primary, related in clusters[:max_items]
         )
         body_html = warning_html + f'<div class="news-list">{news_html}</div>'
 
@@ -1711,6 +1865,9 @@ def main() -> None:
         st.info("当前时间范围下暂无新闻。可以尝试扩大时间范围或选择更多板块。")
 
     show_hot_news_section(hot_df, hot_used_fallback)
+
+    if show_sector_news:
+        render_daily_digest_section(llm_verifier, selected_sectors, sector_deduped_df)
 
     if show_sector_news:
         if not selected_sectors:

@@ -10,11 +10,15 @@ from typing import Any
 import pandas as pd
 
 from analysis_rules import (
+    CATEGORY_WEIGHTS,
     HIGH_IMPACT_SIGNALS,
+    INDUSTRY_SIGNALS,
     MACRO_RULES,
     MEDIUM_IMPACT_SIGNALS,
     NEGATIVE_SIGNALS,
+    POLICY_SIGNALS,
     POSITIVE_SIGNALS,
+    STOCK_MOVE_SIGNALS,
 )
 from fetcher import _is_similar_title, _normalize_title_for_dedupe
 from time_utils import now_utc8_naive
@@ -53,6 +57,20 @@ def _match_macro_rules(text: str) -> tuple[dict[str, tuple[str, str]], list[str]
         for sector, assessment in rule["sector_sentiments"].items():
             assessments.setdefault(sector, assessment)
     return assessments, hit_rules
+
+
+def _news_category(text: str) -> str:
+    """新闻类别：政策 > 产业 > 异动 > 一般资讯。
+
+    政策信号优先；只命中盘面波动词的归为个股异动快讯（重要性最低）。
+    """
+    if any(keyword.casefold() in text for keyword in POLICY_SIGNALS):
+        return "policy"
+    if any(keyword.casefold() in text for keyword in INDUSTRY_SIGNALS):
+        return "industry"
+    if any(keyword.casefold() in text for keyword in STOCK_MOVE_SIGNALS):
+        return "stock_move"
+    return "general"
 
 
 def _impact_level(text: str, macro_hit: bool, direction_strength: float) -> str:
@@ -135,6 +153,12 @@ def analyze_news_item(news: dict[str, Any], target_sectors: list[str]) -> dict[s
 
     direction_strength = max(abs(direction_score), 2.0 if macro_hits else 0.0)
     impact_level = _impact_level(text, bool(macro_hits), direction_strength)
+    category = _news_category(text)
+    importance = (
+        CATEGORY_WEIGHTS.get(category, 1.0) * 2.0
+        + IMPACT_SCORES.get(impact_level, 1.0)
+        + confidence / 100.0
+    )
 
     return {
         "sentiment": overall_sentiment,
@@ -144,6 +168,8 @@ def analyze_news_item(news: dict[str, Any], target_sectors: list[str]) -> dict[s
         "divergent": divergent,
         "sector_assessments": sector_assessments,
         "macro_rules": macro_hits,
+        "category": category,
+        "importance": importance,
     }
 
 
@@ -184,12 +210,12 @@ def _hot_score(
     now: pd.Timestamp,
     related_to_selection: bool,
 ) -> float:
-    score = IMPACT_SCORES.get(analysis["impact_level"], 1.0) * 2.0
+    # importance 已包含类别权重（政策>产业>资讯>异动）、影响等级与置信度
+    score = float(analysis.get("importance", 2.0)) * 1.5
     if analysis["sentiment"] != "neutral" or analysis["divergent"]:
         score += 1.5
     if related_to_selection:
         score += 2.0
-    score += analysis["confidence"] / 100.0
     if pd.notna(publish_time):
         hours_ago = max((now - publish_time).total_seconds() / 3600.0, 0.0)
         score += max(0.0, 1.5 - hours_ago / 16.0)
@@ -257,6 +283,71 @@ def select_hot_news(
             break
 
     return df.iloc[kept_positions].reset_index(drop=True), used_fallback
+
+
+def sort_news_by_importance(df: pd.DataFrame) -> pd.DataFrame:
+    """按重要性降序排列（政策 > 产业事件 > 一般资讯 > 个股异动），同分按时间倒序。"""
+    if df is None or df.empty or "analysis" not in df.columns:
+        return df
+
+    importance = df["analysis"].map(
+        lambda item: float(item.get("importance", 0.0)) if isinstance(item, dict) else 0.0
+    )
+    publish_times = parse_publish_times(df)
+    return (
+        df.assign(_importance=importance, _publish=publish_times.values)
+        .sort_values(["_importance", "_publish"], ascending=[False, False], na_position="last")
+        .drop(columns=["_importance", "_publish"])
+        .reset_index(drop=True)
+    )
+
+
+EVENT_CLUSTER_JACCARD = 0.5
+
+
+def _title_bigrams(title_key: str) -> set[str]:
+    if len(title_key) < 2:
+        return {title_key} if title_key else set()
+    return {title_key[i : i + 2] for i in range(len(title_key) - 1)}
+
+
+def group_similar_news(df: pd.DataFrame) -> list[tuple[int, list[int]]]:
+    """把同一事件的多条报道聚成组，返回 (主报道位置, 其余报道位置) 列表。
+
+    输入应已按重要性排序，组内第一条（最重要的）作为主报道。
+    用标准化标题的字符二元组 Jaccard 相似度 + 序列相似度双重判断，
+    比纯标题相似度能合并更多"同事件不同措辞"的报道。
+    """
+    if df is None or df.empty:
+        return []
+
+    clusters: list[dict[str, Any]] = []
+    for position in range(len(df)):
+        title_key = _normalize_title_for_dedupe(df.iloc[position].get("标题", ""))
+        bigrams = _title_bigrams(title_key)
+
+        matched = None
+        if title_key:
+            for cluster in clusters:
+                if not cluster["title_key"]:
+                    continue
+                union = bigrams | cluster["bigrams"]
+                overlap = len(bigrams & cluster["bigrams"]) / len(union) if union else 0.0
+                if overlap >= EVENT_CLUSTER_JACCARD:
+                    matched = cluster
+                    break
+                if overlap >= 0.3 and _is_similar_title(title_key, [cluster["title_key"]]):
+                    matched = cluster
+                    break
+
+        if matched is not None:
+            matched["members"].append(position)
+        else:
+            clusters.append(
+                {"title_key": title_key, "bigrams": bigrams, "members": [position]}
+            )
+
+    return [(cluster["members"][0], cluster["members"][1:]) for cluster in clusters]
 
 
 def sentiment_counts(analyses: list[dict[str, Any]] | pd.Series) -> dict[str, int]:

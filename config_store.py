@@ -8,10 +8,49 @@ from typing import Any
 from classifier import extract_rule_keywords, normalize_event_rules, normalize_rule
 from paths import DATA_DIR
 from sectors import EVENT_TO_SECTORS, EXTERNAL_EVENTS, SECTORS
+from supabase_store import SupabaseConfigStore, load_supabase_credentials
 
 
 SECTORS_CONFIG_PATH = DATA_DIR / "sectors_config.json"
 EVENTS_CONFIG_PATH = DATA_DIR / "events_config.json"
+SECTORS_CONFIG_KEY = "sectors_config"
+EVENTS_CONFIG_KEY = "events_config"
+
+
+def _get_config_store() -> SupabaseConfigStore | None:
+    credentials = load_supabase_credentials()
+    if credentials is None:
+        return None
+    return SupabaseConfigStore(credentials[0], credentials[1])
+
+
+def _load_remote_config(config_key: str) -> Any | None:
+    """从 Supabase 读取配置；未配置/表缺失/网络失败时返回 None（退回本地）。"""
+    store = _get_config_store()
+    if store is None:
+        return None
+    try:
+        value = store.get_value(config_key)
+    except Exception:
+        return None
+    if not value:
+        return None
+    return json.loads(value)
+
+
+def _save_remote_config(config_key: str, payload: Any) -> None:
+    """写入 Supabase 配置；未配置时跳过，写入失败向上抛出让界面提示。"""
+    store = _get_config_store()
+    if store is None:
+        return
+    store.set_value(config_key, json.dumps(payload, ensure_ascii=False))
+
+
+def _migrate_remote_config(config_key: str, payload: Any) -> None:
+    try:
+        _save_remote_config(config_key, payload)
+    except Exception:
+        pass
 
 
 def _clean_name(value: str) -> str:
@@ -134,14 +173,25 @@ def default_events_config() -> dict[str, Any]:
     }
 
 
-def load_sectors_config() -> dict[str, list[str] | dict[str, Any]]:
+def _load_local_sectors_config() -> dict[str, list[str] | dict[str, Any]]:
     if not SECTORS_CONFIG_PATH.exists():
         sectors = default_sectors_config()
-        save_sectors_config(sectors)
+        _write_json(SECTORS_CONFIG_PATH, _normalize_sectors_payload(sectors))
         return sectors
 
     data = json.loads(SECTORS_CONFIG_PATH.read_text(encoding="utf-8"))
     return _normalize_sectors_payload(data)
+
+
+def load_sectors_config() -> dict[str, list[str] | dict[str, Any]]:
+    remote = _load_remote_config(SECTORS_CONFIG_KEY)
+    if remote is not None:
+        return _normalize_sectors_payload(remote)
+
+    sectors = _load_local_sectors_config()
+    # Supabase 已配置但还没有该配置时，把本地/默认配置迁移上去
+    _migrate_remote_config(SECTORS_CONFIG_KEY, _normalize_sectors_payload(sectors))
+    return sectors
 
 
 def try_load_sectors_config() -> tuple[dict[str, list[str] | dict[str, Any]], str | None]:
@@ -152,7 +202,9 @@ def try_load_sectors_config() -> tuple[dict[str, list[str] | dict[str, Any]], st
 
 
 def save_sectors_config(sectors: dict[str, Any]) -> None:
-    _write_json(SECTORS_CONFIG_PATH, _normalize_sectors_payload(sectors))
+    payload = _normalize_sectors_payload(sectors)
+    _write_json(SECTORS_CONFIG_PATH, payload)
+    _save_remote_config(SECTORS_CONFIG_KEY, payload)
 
 
 def reset_sectors_config() -> dict[str, list[str] | dict[str, Any]]:
@@ -215,17 +267,36 @@ def remove_sector(sector_name: str) -> dict[str, list[str] | dict[str, Any]]:
     return sectors
 
 
-def load_events_config() -> dict[str, Any]:
+def _load_local_events_config() -> dict[str, Any]:
     if not EVENTS_CONFIG_PATH.exists():
         events_config = default_events_config()
-        save_events_config(
-            events_config["external_events"],
-            events_config["event_to_sectors"],
+        _write_json(
+            EVENTS_CONFIG_PATH,
+            {
+                "external_events": normalize_event_rules(events_config["external_events"]),
+                "event_to_sectors": _normalize_mapping(events_config["event_to_sectors"]),
+            },
         )
         return events_config
 
     data = json.loads(EVENTS_CONFIG_PATH.read_text(encoding="utf-8"))
     return _normalize_events_payload(data)
+
+
+def load_events_config() -> dict[str, Any]:
+    remote = _load_remote_config(EVENTS_CONFIG_KEY)
+    if remote is not None:
+        return _normalize_events_payload(remote)
+
+    events_config = _load_local_events_config()
+    _migrate_remote_config(
+        EVENTS_CONFIG_KEY,
+        {
+            "external_events": normalize_event_rules(events_config["external_events"]),
+            "event_to_sectors": _normalize_mapping(events_config["event_to_sectors"]),
+        },
+    )
+    return events_config
 
 
 def try_load_events_config() -> tuple[dict[str, Any], str | None]:
@@ -244,6 +315,7 @@ def save_events_config(
         "event_to_sectors": _normalize_mapping(event_to_sectors),
     }
     _write_json(EVENTS_CONFIG_PATH, payload)
+    _save_remote_config(EVENTS_CONFIG_KEY, payload)
 
 
 def reset_events_config() -> dict[str, Any]:

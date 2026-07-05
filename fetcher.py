@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -520,27 +521,161 @@ def _record_akshare_result(success: bool) -> None:
             _AKSHARE_SKIP_UNTIL = time.time() + AKSHARE_SKIP_SECONDS
 
 
+# 补充数据源：财联社电报、新浪全球快讯。整流抓取一次后按关键词本地匹配，
+# 进程内缓存 5 分钟（含失败结果），避免每个关键词重复请求或反复等待超时。
+STREAM_TTL_SECONDS = 300
+_STREAM_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_STREAM_CACHE_LOCK = Lock()
+
+
+def _stream_link(base_link: str, title: str, publish_time: str) -> str:
+    # 快讯类接口没有单条 URL，用真实列表页 + 内容指纹片段保证链接唯一可去重
+    digest = hashlib.sha1(f"{title}|{publish_time}".encode("utf-8")).hexdigest()[:12]
+    return f"{base_link}#{digest}"
+
+
+def _normalize_stream_frame(
+    raw_df: pd.DataFrame,
+    source_name: str,
+    base_link: str,
+) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return _empty_news_frame()
+
+    title_col = _pick_column(raw_df, TITLE_COLUMNS)
+    content_col = _pick_column(raw_df, CONTENT_COLUMNS)
+    time_col = _pick_column(raw_df, TIME_COLUMNS)
+    date_col = "发布日期" if "发布日期" in raw_df.columns else None
+
+    rows: list[dict[str, str]] = []
+    for record in raw_df.to_dict("records"):
+        content = _clean_text(record.get(content_col)) if content_col else ""
+        title = _clean_text(record.get(title_col)) if title_col else ""
+        if not title:
+            title = content[:40]
+        if not title:
+            continue
+        publish_time = _clean_text(record.get(time_col)) if time_col else ""
+        if date_col:
+            publish_date = _clean_text(record.get(date_col))
+            if publish_date and publish_date not in publish_time:
+                publish_time = f"{publish_date} {publish_time}".strip()
+        rows.append(
+            {
+                "标题": title,
+                "来源媒体": source_name,
+                "发布时间": publish_time,
+                "原文链接": _stream_link(base_link, title, publish_time),
+                "匹配关键词": "",
+                "新闻内容": content,
+            }
+        )
+
+    if not rows:
+        return _empty_news_frame()
+    return pd.DataFrame(rows, columns=[*DISPLAY_COLUMNS, "匹配关键词", "新闻内容"])
+
+
+STREAM_SOURCES: tuple[tuple[str, str, str, str], ...] = (
+    ("cls_telegraph", "stock_telegraph_cls", "财联社电报", "https://www.cls.cn/telegraph"),
+    ("sina_global", "stock_info_global_sina", "新浪财经快讯", "https://finance.sina.com.cn/7x24/"),
+)
+
+
+def _fetch_stream_frame(
+    cache_key: str,
+    akshare_fn_name: str,
+    source_name: str,
+    base_link: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> pd.DataFrame:
+    now = time.time()
+    with _STREAM_CACHE_LOCK:
+        cached = _STREAM_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < STREAM_TTL_SECONDS:
+            return cached[1]
+
+    frame = _empty_news_frame()
+    try:
+        if ak is None:
+            raise ImportError(f"akshare 未安装：{AKSHARE_IMPORT_ERROR}")
+        fetch_fn = getattr(ak, akshare_fn_name, None)
+        if fetch_fn is None:
+            raise RuntimeError(f"akshare 缺少 {akshare_fn_name} 接口")
+        with _akshare_regex_compat():
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(fetch_fn)
+            try:
+                raw_df = future.result(timeout=timeout)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+        frame = _normalize_stream_frame(raw_df, source_name, base_link)
+    except Exception:
+        # 失败也写入缓存（空表），TTL 内不再重试，避免逐关键词等待超时
+        frame = _empty_news_frame()
+
+    with _STREAM_CACHE_LOCK:
+        _STREAM_CACHE[cache_key] = (time.time(), frame)
+    return frame
+
+
+def fetch_supplemental_keyword_news(
+    keyword: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for cache_key, fn_name, source_name, base_link in STREAM_SOURCES:
+        stream_df = _fetch_stream_frame(cache_key, fn_name, source_name, base_link, timeout)
+        if stream_df.empty:
+            continue
+        mask = stream_df["标题"].str.contains(
+            keyword, case=False, regex=False
+        ) | stream_df["新闻内容"].str.contains(keyword, case=False, regex=False)
+        matched = stream_df[mask]
+        if not matched.empty:
+            matched = matched.copy()
+            matched["匹配关键词"] = keyword
+            frames.append(matched)
+    if not frames:
+        return _empty_news_frame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def fetch_keyword_news(keyword: str, timeout: int = DEFAULT_TIMEOUT) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
     akshare_error: Exception | None = None
+    primary_error: Exception | None = None
 
     if _akshare_available():
         try:
-            result = _fetch_from_akshare(keyword, timeout=timeout)
+            frames.append(_fetch_from_akshare(keyword, timeout=timeout))
             _record_akshare_result(True)
-            return result
         except Exception as exc:
             _record_akshare_result(False)
             akshare_error = exc
     else:
         akshare_error = RuntimeError("AKShare 近期连续失败，已暂时切换到东方财富数据源")
 
-    try:
-        return _fetch_from_eastmoney(keyword, timeout=timeout)
-    except Exception as exc:
-        raise RuntimeError(
-            f"关键词「{keyword}」抓取失败；AKShare 错误：{akshare_error}；"
-            f"东方财富 fallback 错误：{exc}"
-        ) from exc
+    if not frames:
+        try:
+            frames.append(_fetch_from_eastmoney(keyword, timeout=timeout))
+        except Exception as exc:
+            primary_error = RuntimeError(
+                f"关键词「{keyword}」抓取失败；AKShare 错误：{akshare_error}；"
+                f"东方财富 fallback 错误：{exc}"
+            )
+
+    supplemental_df = fetch_supplemental_keyword_news(keyword, timeout=timeout)
+    if not supplemental_df.empty:
+        frames.append(supplemental_df)
+
+    if frames:
+        if len(frames) == 1:
+            return frames[0]
+        return pd.concat(frames, ignore_index=True)
+    if primary_error is not None:
+        raise primary_error
+    return _empty_news_frame()
 
 
 def _fetch_keywords_news(
