@@ -5,8 +5,10 @@ import pandas as pd
 from analysis import (
     analyze_display_frame,
     analyze_news_item,
+    group_similar_news,
     select_hot_news,
     sentiment_counts,
+    sort_news_by_importance,
 )
 from time_utils import now_utc8_naive
 
@@ -130,6 +132,45 @@ def test_external_event_only_hot_when_related_to_selection() -> None:
     assert len(hot_df) == 1
 
 
+def test_importance_ranking_policy_over_stock_move() -> None:
+    policy = analyze_news_item({"标题": "证监会发布新规征求意见", "新闻内容": ""}, ["证券"])
+    industry = analyze_news_item({"标题": "龙头厂商宣布扩产，订单饱满", "新闻内容": ""}, ["光伏"])
+    stock_move = analyze_news_item({"标题": "半导体板块盘中拉升，多股涨停", "新闻内容": ""}, ["半导体芯片"])
+    assert policy["category"] == "policy"
+    assert industry["category"] == "industry"
+    assert stock_move["category"] == "stock_move"
+    assert policy["importance"] > industry["importance"] > stock_move["importance"]
+
+
+def test_sort_news_by_importance() -> None:
+    now = now_utc8_naive().strftime("%Y-%m-%d %H:%M:%S")
+    df = pd.DataFrame(
+        [
+            _display_row("半导体板块盘中拉升，多股涨停", now),
+            _display_row("工信部发布半导体产业支持政策", now),
+        ]
+    )
+    df["analysis"] = analyze_display_frame(df)
+    sorted_df = sort_news_by_importance(df)
+    assert sorted_df.iloc[0]["标题"] == "工信部发布半导体产业支持政策"
+
+
+def test_group_similar_news_clusters_same_event() -> None:
+    now = now_utc8_naive().strftime("%Y-%m-%d %H:%M:%S")
+    df = pd.DataFrame(
+        [
+            _display_row("英伟达发布新一代 GPU 芯片，算力大幅提升", now, link="http://a.com/1"),
+            _display_row("英伟达正式发布新一代 GPU 芯片 算力提升明显", now, link="http://b.com/2"),
+            _display_row("光伏组件价格企稳回升", now, link="http://c.com/3"),
+        ]
+    )
+    df["analysis"] = analyze_display_frame(df)
+    clusters = group_similar_news(df)
+    assert len(clusters) == 2
+    primary, related = clusters[0]
+    assert len(related) == 1
+
+
 def test_sentiment_counts() -> None:
     analyses = [
         {"sentiment": "positive"},
@@ -150,5 +191,8 @@ if __name__ == "__main__":
     test_hot_news_selection_prefers_today_high_impact()
     test_hot_news_dedupes_similar_titles()
     test_external_event_only_hot_when_related_to_selection()
+    test_importance_ranking_policy_over_stock_move()
+    test_sort_news_by_importance()
+    test_group_similar_news_clusters_same_event()
     test_sentiment_counts()
     print("test_analysis.py: ok")

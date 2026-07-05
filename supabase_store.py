@@ -46,8 +46,8 @@ def news_row_id(row: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-class SupabaseNewsStore:
-    """通过 Supabase PostgREST API 读写 news_cache 表。
+class _SupabaseTable:
+    """Supabase PostgREST 单表客户端基类。
 
     需要使用 service_role key（表已开启 RLS 时 anon key 无法读写），
     key 只在服务端使用，不会暴露给浏览器。
@@ -57,7 +57,7 @@ class SupabaseNewsStore:
         self,
         url: str,
         key: str,
-        table: str = NEWS_TABLE,
+        table: str,
         timeout: int = DEFAULT_TIMEOUT,
     ) -> None:
         self._endpoint = f"{url.rstrip('/')}/rest/v1/{table}"
@@ -92,6 +92,18 @@ class SupabaseNewsStore:
                 f"Supabase 返回错误 {response.status_code}：{response.text[:200]}"
             )
         return response
+
+class SupabaseNewsStore(_SupabaseTable):
+    """读写 news_cache 表。"""
+
+    def __init__(
+        self,
+        url: str,
+        key: str,
+        table: str = NEWS_TABLE,
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> None:
+        super().__init__(url, key, table, timeout)
 
     def _fetch_paged(self, select: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -165,3 +177,36 @@ class SupabaseNewsStore:
 
     def delete_all(self) -> None:
         self._request("DELETE", params={"id": "neq."})
+
+
+CONFIG_TABLE = "app_config"
+
+
+class SupabaseConfigStore(_SupabaseTable):
+    """读写 app_config 表（key -> JSON 文本），用于持久化板块/事件配置。"""
+
+    def __init__(
+        self,
+        url: str,
+        key: str,
+        table: str = CONFIG_TABLE,
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> None:
+        super().__init__(url, key, table, timeout)
+
+    def get_value(self, config_key: str) -> str | None:
+        response = self._request(
+            "GET",
+            params={"select": "value", "key": f"eq.{config_key}", "limit": "1"},
+        )
+        rows = response.json()
+        if isinstance(rows, list) and rows:
+            return str(rows[0].get("value", "") or "") or None
+        return None
+
+    def set_value(self, config_key: str, value: str) -> None:
+        self._request(
+            "POST",
+            json_body=[{"key": config_key, "value": value}],
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )

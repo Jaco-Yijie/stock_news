@@ -75,6 +75,19 @@ alter table news_cache enable row level security;
 
 开启 RLS（Row Level Security，行级安全）且不加任何策略，意味着匿名 key 无法读写这张表，只有下面的 service_role key（服务端密钥）可以，这是预期的安全配置。
 
+同时创建配置表（用于持久化页面上编辑的板块关键词、外部事件规则）：
+
+```sql
+create table if not exists app_config (
+  key text primary key,
+  value text not null default ''
+);
+
+alter table app_config enable row level security;
+```
+
+建好后，页面上对关键词、板块、外部事件的所有修改都会同时写入 Supabase，应用重启后不再丢失；首次读取时会自动把现有本地配置迁移上去。未建此表时配置退回本地文件（云端重启会丢失编辑内容，保存时会看到报错提示）。
+
 ### 3. 获取连接信息
 
 在 Supabase 项目的 Settings 中获取两个值：
