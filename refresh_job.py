@@ -16,6 +16,7 @@ import sys
 from config_store import try_load_events_config, try_load_sectors_config
 from llm_provider import load_llm_verifier_from_env
 from news_store import cache_backend_name, save_cache
+from notify import push_daily_report, push_important_news
 from refresh import prune_old_cache, run_full_refresh, run_incremental_refresh
 
 
@@ -38,6 +39,16 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=30,
         help="缓存保留天数，超过的旧新闻会被清理；0 表示不清理（默认 30）",
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="跳过重要新闻推送（默认在配置了推送通道时自动推送）",
+    )
+    parser.add_argument(
+        "--daily-report",
+        action="store_true",
+        help="刷新完成后推送每日早报（最近 24 小时要闻 Top 榜）",
     )
     args = parser.parse_args(argv)
 
@@ -87,6 +98,17 @@ def main(argv: list[str] | None = None) -> int:
         f"[info] 完成：新增 {outcome.added_count} 条，"
         f"清理过期 {pruned_count} 条，缓存共 {len(final_cache)} 条。"
     )
+
+    if not args.no_notify:
+        try:
+            push_important_news(final_cache)
+        except Exception as exc:
+            print(f"[warning] 重要新闻推送异常：{exc}")
+    if args.daily_report:
+        try:
+            push_daily_report(final_cache, llm_verifier=llm_verifier)
+        except Exception as exc:
+            print(f"[warning] 每日早报推送异常：{exc}")
     return 0
 
 
