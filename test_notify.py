@@ -23,8 +23,10 @@ from time_utils import now_utc8_naive
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code: int = 200):
         self._payload = payload
+        self.status_code = status_code
+        self.text = json.dumps(payload, ensure_ascii=False)
 
     def raise_for_status(self):
         pass
@@ -133,6 +135,34 @@ def test_push_history_roundtrip_and_dedup(tmp_path: Path = None) -> None:
     assert list(fresh["原文链接"]) == ["http://e.com/b"]
 
 
+def test_load_notifiers_cleans_pasted_secrets() -> None:
+    import os
+
+    os.environ["SERVERCHAN_SENDKEY"] = " SCT123\nabc "
+    try:
+        notifiers = notify.load_notifiers_from_env()
+    finally:
+        os.environ.pop("SERVERCHAN_SENDKEY", None)
+        os.environ.pop("PUSHPLUS_TOKEN", None)
+    serverchan = [n for n in notifiers if n.name == "Server酱"]
+    assert serverchan, "应识别出 Server酱 通道"
+    assert serverchan[0]._url == "https://sctapi.ftqq.com/SCT123abc.send"
+
+
+def test_http_error_includes_response_body() -> None:
+    def fake_post(url, data=None, json=None, timeout=None):
+        return FakeResponse({"message": "bad pushkey"}, status_code=400)
+
+    original_post = notify.requests.post
+    notify.requests.post = fake_post
+    try:
+        errors = send_to_all([ServerChanNotifier("badkey")], "标题", "内容")
+    finally:
+        notify.requests.post = original_post
+    assert len(errors) == 1
+    assert "400" in errors[0] and "bad pushkey" in errors[0]
+
+
 def test_format_push_markdown_contains_labels() -> None:
     df = pd.DataFrame(
         [_display_row("证监会发布利好新规", "2026-07-05 09:00:00", "http://e.com/x")]
@@ -149,5 +179,7 @@ if __name__ == "__main__":
     test_send_to_all_collects_errors()
     test_select_push_worthy_rules()
     test_push_history_roundtrip_and_dedup()
+    test_load_notifiers_cleans_pasted_secrets()
+    test_http_error_includes_response_body()
     test_format_push_markdown_contains_labels()
     print("test_notify.py: ok")
