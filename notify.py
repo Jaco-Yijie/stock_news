@@ -35,6 +35,18 @@ PUSH_HISTORY_PATH = DATA_DIR / "push_history.json"
 PUSH_HISTORY_LIMIT = 800
 
 
+def _clean_secret(value: str) -> str:
+    # 粘贴密钥时容易混入空格/换行，出现在 URL 或请求头里会导致 400
+    return "".join(str(value or "").split())
+
+
+def _ensure_http_ok(response: requests.Response, channel: str) -> None:
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"{channel} HTTP {response.status_code}：{response.text[:200]}"
+        )
+
+
 class ServerChanNotifier:
     name = "Server酱"
 
@@ -48,7 +60,7 @@ class ServerChanNotifier:
             data={"title": title[:32], "desp": content},
             timeout=self._timeout,
         )
-        response.raise_for_status()
+        _ensure_http_ok(response, self.name)
         payload = response.json()
         if payload.get("code") not in (0, 200):
             raise RuntimeError(f"Server酱返回错误：{str(payload)[:200]}")
@@ -72,7 +84,7 @@ class PushPlusNotifier:
             },
             timeout=self._timeout,
         )
-        response.raise_for_status()
+        _ensure_http_ok(response, self.name)
         payload = response.json()
         if payload.get("code") != 200:
             raise RuntimeError(f"PushPlus 返回错误：{str(payload)[:200]}")
@@ -92,7 +104,7 @@ class TelegramNotifier:
             json={"chat_id": self._chat_id, "text": f"{title}\n\n{content}"},
             timeout=self._timeout,
         )
-        response.raise_for_status()
+        _ensure_http_ok(response, self.name)
         payload = response.json()
         if not payload.get("ok"):
             raise RuntimeError(f"Telegram 返回错误：{str(payload)[:200]}")
@@ -100,14 +112,14 @@ class TelegramNotifier:
 
 def load_notifiers_from_env() -> list[Any]:
     notifiers: list[Any] = []
-    sendkey = os.getenv("SERVERCHAN_SENDKEY", "").strip()
+    sendkey = _clean_secret(os.getenv("SERVERCHAN_SENDKEY", ""))
     if sendkey:
         notifiers.append(ServerChanNotifier(sendkey))
-    pushplus_token = os.getenv("PUSHPLUS_TOKEN", "").strip()
+    pushplus_token = _clean_secret(os.getenv("PUSHPLUS_TOKEN", ""))
     if pushplus_token:
         notifiers.append(PushPlusNotifier(pushplus_token))
-    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    telegram_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    telegram_token = _clean_secret(os.getenv("TELEGRAM_BOT_TOKEN", ""))
+    telegram_chat = _clean_secret(os.getenv("TELEGRAM_CHAT_ID", ""))
     if telegram_token and telegram_chat:
         notifiers.append(TelegramNotifier(telegram_token, telegram_chat))
     return notifiers
