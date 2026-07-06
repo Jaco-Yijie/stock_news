@@ -435,6 +435,7 @@ def inject_styles() -> None:
         .tag-hot { background: #fff1f0; color: #c0392b; border-color: #fbc4c0; }
         .tag-cat-policy { background: #eff6ff; color: #1d4ed8; border-color: #dbeafe; }
         .tag-cat-stock_move { background: #f9fafb; color: #9ca3af; border-color: #eceff2; }
+        .tag-low-conf { background: #fffbeb; color: #92400e; border-color: #fde68a; }
 
         details.related-reports {
             margin-top: 6px;
@@ -534,7 +535,8 @@ def inject_styles() -> None:
             }
 
             .metric-grid {
-                grid-template-columns: 1fr;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 0.45rem;
                 min-width: 0;
                 width: 100%;
             }
@@ -573,15 +575,28 @@ def inject_styles() -> None:
             }
 
             .metric-card {
-                padding: 10px 12px;
+                padding: 7px 10px;
             }
 
             .metric-label {
-                font-size: 12px;
+                font-size: 11px;
+                margin-bottom: 2px;
             }
 
             .metric-value {
-                font-size: 15px;
+                font-size: 14px;
+            }
+
+            .hot-title {
+                font-size: 17px;
+            }
+
+            .news-reason {
+                font-size: 12px;
+            }
+
+            .filter-status {
+                font-size: 12px;
             }
 
             .sector-heading {
@@ -852,26 +867,39 @@ def filter_news(news_df: pd.DataFrame, keyword: str, selected_sources: list[str]
     return filtered_df.reset_index(drop=True)
 
 
-def sentiment_tag_html(
-    sentiment: str,
-    low_confidence: bool = False,
-    divergent: bool = False,
-    prefix: str = "",
-) -> str:
+LOW_CONFIDENCE_TAG = '<span class="tag tag-low-conf">低置信</span>'
+DIVERGENT_TAG = '<span class="tag tag-neu">板块分化</span>'
+
+
+def sentiment_tag_html(sentiment: str, prefix: str = "") -> str:
     css_class = {"positive": "tag-pos", "negative": "tag-neg"}.get(sentiment, "tag-neu")
     label = SENTIMENT_LABELS.get(sentiment, "中性")
-    if sentiment == "neutral" and divergent:
-        label = "中性｜板块分化"
-    elif sentiment == "neutral" and low_confidence:
-        label = "中性｜判断依据不足"
     if prefix:
         label = f"{prefix}·{label}"
     return f'<span class="tag {css_class}">{escape(label)}</span>'
 
 
+def sentiment_tags_html(
+    sentiment: str,
+    low_confidence: bool = False,
+    divergent: bool = False,
+    prefix: str = "",
+) -> str:
+    html = sentiment_tag_html(sentiment, prefix)
+    if sentiment == "neutral":
+        if divergent:
+            html += DIVERGENT_TAG
+        elif low_confidence:
+            html += LOW_CONFIDENCE_TAG
+    return html
+
+
 def impact_tag_html(impact_level: str) -> str:
     label = IMPACT_LABELS.get(impact_level, "低影响")
-    return f'<span class="tag tag-impact-{escape(impact_level)}">{label}</span>'
+    title_attr = ""
+    if impact_level == "high":
+        title_attr = ' title="依据政策、宏观事件或产业信号词判定"'
+    return f'<span class="tag tag-impact-{escape(impact_level)}"{title_attr}>{label}</span>'
 
 
 def _row_analysis(row: pd.Series) -> dict[str, Any]:
@@ -902,11 +930,7 @@ def news_tags_html(row: pd.Series, hot_links: set[str] | None = None) -> str:
         shown = 0
         for sector, assessment in assessments.items():
             tags.append(
-                sentiment_tag_html(
-                    assessment.get("sentiment", "neutral"),
-                    low_confidence=low_confidence,
-                    prefix=sector,
-                )
+                sentiment_tag_html(assessment.get("sentiment", "neutral"), prefix=sector)
             )
             shown += 1
             if shown >= 3:
@@ -914,7 +938,7 @@ def news_tags_html(row: pd.Series, hot_links: set[str] | None = None) -> str:
         if not assessments or analysis.get("divergent"):
             tags.insert(
                 0,
-                sentiment_tag_html(
+                sentiment_tags_html(
                     analysis.get("sentiment", "neutral"),
                     low_confidence=low_confidence,
                     divergent=bool(analysis.get("divergent")),
@@ -927,7 +951,7 @@ def news_tags_html(row: pd.Series, hot_links: set[str] | None = None) -> str:
             assessment.get("sentiment") if assessment else analysis.get("sentiment", "neutral")
         )
         tags.append(
-            sentiment_tag_html(
+            sentiment_tags_html(
                 sentiment,
                 low_confidence=low_confidence,
                 divergent=bool(analysis.get("divergent")),
@@ -942,7 +966,7 @@ def news_tags_html(row: pd.Series, hot_links: set[str] | None = None) -> str:
         )
     link = str(row.get("原文链接", ""))
     if hot_links and link in hot_links:
-        tags.append('<span class="tag tag-hot">今日热点</span>')
+        tags.append('<span class="tag tag-hot">今日重点</span>')
     return f'<div class="news-tags">{"".join(tags)}</div>'
 
 
@@ -1053,7 +1077,7 @@ def render_hot_news_item(row: pd.Series) -> str:
     sectors_text = escape("、".join(sectors) if sectors else "暂无明确映射")
 
     tags = (
-        sentiment_tag_html(
+        sentiment_tags_html(
             analysis.get("sentiment", "neutral"),
             low_confidence=_is_low_confidence(analysis),
             divergent=bool(analysis.get("divergent")),
@@ -1148,12 +1172,13 @@ def render_daily_digest_section(
 
 
 def show_hot_news_section(hot_df: pd.DataFrame, used_fallback: bool) -> None:
-    st.markdown('<div class="section-title">今日热点新闻</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">今日重点新闻</div>', unsafe_allow_html=True)
+    st.caption("范围：全部板块与相关外部事件，与关注板块相关的新闻优先。")
     if hot_df is None or hot_df.empty:
-        st.info("今日暂无足够高相关度的热点新闻。可以尝试刷新数据或选择更多板块。")
+        st.info("今日暂无足够重要的新闻。可以尝试刷新数据或选择更多板块。")
         return
     if used_fallback:
-        st.caption("今日高相关热点不足，已补充最近 24 小时的重要新闻。")
+        st.caption("今日重点新闻不足，已补充最近 24 小时的重要新闻。")
     cards = "".join(render_hot_news_item(row) for _, row in hot_df.iterrows())
     st.markdown(cards, unsafe_allow_html=True)
 
@@ -1312,8 +1337,9 @@ def render_dashboard_header(
                 <div class="dashboard-title">A股板块新闻</div>
                 <div class="dashboard-subtitle">按板块聚合市场新闻，识别可能受影响的行业与事件方向</div>
                 <div class="filter-status">
-                    数据更新：<b>{escape(latest_cache_at)}</b><br>
-                    当前关注：<b>{escape(shown)}</b> ｜ 筛选：{escape(filter_summary)}
+                    数据更新：<b>{escape(latest_cache_at)}</b> ｜ 当前关注：<b>{escape(shown)}</b><br>
+                    统计范围：关注板块与外部事件的<b>今日</b>新闻（UTC+8），不受下方列表筛选影响<br>
+                    列表筛选：{escape(filter_summary)}
                 </div>
             </div>
             <div class="metric-grid">
@@ -1677,17 +1703,17 @@ def main() -> None:
     if events_config_error:
         st.sidebar.warning(events_config_error)
 
-    if st.sidebar.button("清除全部筛选"):
+    if st.sidebar.button("重置筛选"):
         reset_all_filters(sectors_config)
 
     sector_query = st.sidebar.text_input(
         "板块搜索", placeholder="输入板块或关键词", key="sector_query"
     )
     select_col, clear_col = st.sidebar.columns(2)
-    if select_col.button("全选"):
+    if select_col.button("全选板块"):
         for sector in sectors_config:
             st.session_state[f"sector_selected::{sector}"] = True
-    if clear_col.button("清空"):
+    if clear_col.button("清空板块"):
         for sector in sectors_config:
             st.session_state[f"sector_selected::{sector}"] = False
 
@@ -1699,7 +1725,7 @@ def main() -> None:
         if st.session_state.get(f"sector_selected::{sector}", False)
     ]
     if selected_sectors:
-        st.sidebar.markdown("**当前已选：**" + "、".join(selected_sectors))
+        st.sidebar.markdown("当前已选：**" + "、".join(selected_sectors) + "**")
     else:
         st.sidebar.caption("尚未选择板块")
 
@@ -1716,6 +1742,9 @@ def main() -> None:
     keyword = st.sidebar.text_input(
         "关键词搜索", placeholder="标题、命中关键词、来源媒体", key="keyword_search"
     )
+    # 占位容器：来源媒体选项依赖缓存数据，数据加载后再填充，
+    # 但视觉位置保持在关键词搜索之后、展示条数之前
+    source_filter_container = st.sidebar.container()
     max_items = st.sidebar.slider(
         "每个板块最多展示条数", min_value=5, max_value=100, key="max_items"
     )
@@ -1787,10 +1816,14 @@ def main() -> None:
         for source in st.session_state.get("source_filter", [])
         if source in available_sources
     ]
-    selected_sources = st.sidebar.multiselect(
-        "来源媒体", options=available_sources, key="source_filter"
-    )
-    st.sidebar.caption(f"缓存共 {int(metadata['total'])} 条新闻")
+    with source_filter_container:
+        selected_sources = st.multiselect(
+            "来源媒体",
+            options=available_sources,
+            key="source_filter",
+            placeholder="选择来源媒体",
+        )
+        st.caption(f"缓存共 {int(metadata['total'])} 条新闻")
 
     results: dict[str, SectorResult] = {}
     warnings_by_sector = st.session_state.get("last_sector_warnings", {})
@@ -1857,6 +1890,9 @@ def main() -> None:
         today_total=today_total,
         hot_count=len(hot_df),
         today_counts=today_counts,
+    )
+    st.caption(
+        "利好 / 利空 / 影响等级由规则与新闻文本自动生成，仅供信息参考，不构成投资建议。"
     )
 
     if raw_cache_display_df.empty:
