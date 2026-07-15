@@ -47,7 +47,15 @@ from news_store import (
 )
 from refresh import run_full_refresh, run_incremental_refresh
 from sectors import SECTORS as DEFAULT_SECTORS
-from time_utils import format_utc8_time, now_utc8_naive
+from stock_search import (
+    StockProfile,
+    fetch_stock_profile,
+    format_market_cap,
+    load_stock_list,
+    match_sectors_for_stock,
+    search_stocks,
+)
+from time_utils import now_utc8_naive
 
 
 st.set_page_config(page_title="A股板块新闻", page_icon="📰", layout="wide")
@@ -706,6 +714,18 @@ def load_display_data(
     )
 
 
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_stock_list() -> list[tuple[str, str]]:
+    """A 股代码-名称列表，每天最多拉取一次；失败时退回内置列表。"""
+    return load_stock_list()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_stock_profile(code: str, name: str) -> StockProfile:
+    """个股基本信息与实时行情，5 分钟内复用。"""
+    return fetch_stock_profile(code, name)
+
+
 def parse_keyword_input(value: str) -> list[str]:
     return [
         item.strip()
@@ -1256,6 +1276,177 @@ def show_sector_section(
     )
 
 
+def _format_quote_change(quote: dict[str, str]) -> tuple[str, str]:
+    """返回（涨跌幅文本, tag 样式类）。A 股习惯：红涨绿跌。"""
+    raw = quote.get("涨幅", "")
+    try:
+        change = float(raw)
+    except (TypeError, ValueError):
+        return "", "tag-neu"
+    if change > 0:
+        return f"+{change:.2f}%", "tag-pos"
+    if change < 0:
+        return f"{change:.2f}%", "tag-neg"
+    return "0.00%", "tag-neu"
+
+
+def render_stock_profile_card(profile: StockProfile, related_sectors: list[str]) -> None:
+    quote_tags = ""
+    latest = str(profile.quote.get("最新", "") or "").strip()
+    if latest:
+        change_text, change_class = _format_quote_change(profile.quote)
+        quote_tags = f'<span class="pill">最新价 {escape(latest)}</span>'
+        if change_text:
+            quote_tags += f'<span class="tag {change_class}">{escape(change_text)}</span>'
+
+    metrics: list[tuple[str, str]] = [
+        ("所属行业", profile.industry or "-"),
+        ("总市值", format_market_cap(profile.info.get("总市值", ""))),
+        ("流通市值", format_market_cap(profile.info.get("流通市值", ""))),
+        ("上市时间", profile.info.get("上市时间", "-") or "-"),
+    ]
+    metric_html = "".join(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">{escape(label)}</div>
+            <div class="metric-value">{escape(str(value))}</div>
+        </div>
+        """
+        for label, value in metrics
+    )
+
+    if related_sectors:
+        sector_pills = "".join(
+            f'<span class="keyword-tag">{escape(sector)}</span>'
+            for sector in related_sectors
+        )
+        sectors_html = (
+            f'<div class="news-meta" style="margin-top:0.6rem;">关联板块：{sector_pills}</div>'
+        )
+    else:
+        sectors_html = (
+            '<div class="news-meta" style="margin-top:0.6rem;">'
+            "未能识别关联板块，下方仅展示直接提及该股票的新闻。</div>"
+        )
+
+    warning_html = ""
+    if profile.error:
+        warning_html = f'<div class="section-warning">{escape(profile.error)}</div>'
+
+    st.markdown(
+        f"""
+        <section class="sector-section">
+            <div class="sector-heading">
+                <div class="sector-name">📈 {escape(profile.name)}（{escape(profile.code)}）</div>
+                <div class="sector-meta">{quote_tags}</div>
+            </div>
+            {warning_html}
+            <div class="metric-grid">{metric_html}</div>
+            {sectors_html}
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def show_stock_mention_news(
+    stock_name: str,
+    sector_time_df: pd.DataFrame,
+    external_time_df: pd.DataFrame,
+    selected_sources: list[str],
+    max_items: int,
+    hot_links: set[str] | None,
+) -> None:
+    frames = [df for df in (sector_time_df, external_time_df) if not df.empty]
+    combined_df = (
+        pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    )
+    mention_df = filter_news(combined_df, stock_name, selected_sources)
+    if not mention_df.empty and "原文链接" in mention_df.columns:
+        mention_df = mention_df.drop_duplicates(subset=["原文链接"]).reset_index(drop=True)
+
+    if mention_df.empty:
+        body_html = (
+            '<div class="empty-state">缓存新闻中暂未直接提及该股票，'
+            "可查看下方关联板块新闻。</div>"
+        )
+    else:
+        sorted_df = sort_news_by_importance(mention_df)
+        news_html = "".join(
+            render_news_item(sorted_df.iloc[position], hot_links)
+            for position in range(min(len(sorted_df), max_items))
+        )
+        body_html = f'<div class="news-list">{news_html}</div>'
+
+    st.markdown(
+        f"""
+        <section class="sector-section">
+            <div class="sector-heading">
+                <div class="sector-name">{escape(stock_name)}直接相关新闻</div>
+                <div class="sector-meta">
+                    <span class="pill">共 {len(mention_df)} 条</span>
+                </div>
+            </div>
+            {body_html}
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def show_stock_search_section(
+    stock_query: str,
+    sector_time_df: pd.DataFrame,
+    external_time_df: pd.DataFrame,
+    sectors_config: dict[str, Any],
+    selected_sources: list[str],
+    max_items: int,
+    hot_links: set[str] | None,
+) -> None:
+    st.markdown('<div class="section-title">股票搜索</div>', unsafe_allow_html=True)
+    matches = search_stocks(stock_query, cached_stock_list())
+    if not matches:
+        st.info(f"未找到与“{stock_query}”匹配的股票，请检查代码或名称。")
+        return
+
+    match = matches[0]
+    if len(matches) > 1:
+        match = st.selectbox(
+            "匹配到多只股票，请选择",
+            options=matches,
+            format_func=lambda item: item.label,
+        )
+
+    with st.spinner(f"正在获取 {match.name} 的信息…"):
+        profile = cached_stock_profile(match.code, match.name)
+    related_sectors = match_sectors_for_stock(
+        match.name, profile.industry, sectors_config
+    )
+
+    render_stock_profile_card(profile, related_sectors)
+    show_stock_mention_news(
+        match.name,
+        sector_time_df,
+        external_time_df,
+        selected_sources,
+        max_items,
+        hot_links,
+    )
+
+    for sector in related_sectors:
+        sector_df = sector_time_df[
+            sector_time_df["sector"] == sector
+        ].reset_index(drop=True) if "sector" in sector_time_df.columns else sector_time_df.iloc[0:0]
+        show_sector_section(
+            sector,
+            SectorResult(data=sector_df),
+            "",
+            selected_sources,
+            max_items,
+            hot_links,
+        )
+
+
 def show_external_events_section(
     external_df: pd.DataFrame,
     warnings_by_event: dict[str, list[str]],
@@ -1316,31 +1507,15 @@ def show_external_events_section(
 
 
 def render_dashboard_header(
-    latest_cache_at: str,
-    selected_sectors: list[str],
-    filter_summary: str,
     today_total: int,
     hot_count: int,
     today_counts: dict[str, int],
 ) -> None:
-    if selected_sectors:
-        shown = "、".join(selected_sectors[:3])
-        if len(selected_sectors) > 3:
-            shown += f" 等 {len(selected_sectors)} 个板块"
-    else:
-        shown = "未选择板块"
-
     st.markdown(
         f"""
         <section class="dashboard-header">
             <div>
                 <div class="dashboard-title">A股板块新闻</div>
-                <div class="dashboard-subtitle">按板块聚合市场新闻，识别可能受影响的行业与事件方向</div>
-                <div class="filter-status">
-                    数据更新：<b>{escape(latest_cache_at)}</b> ｜ 当前关注：<b>{escape(shown)}</b><br>
-                    统计范围：关注板块与外部事件的<b>今日</b>新闻（UTC+8），不受下方列表筛选影响<br>
-                    列表筛选：{escape(filter_summary)}
-                </div>
             </div>
             <div class="metric-grid">
                 <div class="metric-card">
@@ -1555,6 +1730,7 @@ def render_event_config_manager(
 
 
 FILTER_STATE_DEFAULTS: dict[str, Any] = {
+    "stock_query": "",
     "sector_query": "",
     "display_scope": "全部",
     "time_range": "全部",
@@ -1705,6 +1881,13 @@ def main() -> None:
 
     if st.sidebar.button("重置筛选"):
         reset_all_filters(sectors_config)
+
+    stock_query = st.sidebar.text_input(
+        "股票搜索",
+        placeholder="股票代码或名称，如 600519 / 贵州茅台",
+        key="stock_query",
+        help="搜索个股后，页面顶部会展示该股票的基本信息、关联板块及相关新闻",
+    )
 
     sector_query = st.sidebar.text_input(
         "板块搜索", placeholder="输入板块或关键词", key="sector_query"
@@ -1871,22 +2054,7 @@ def main() -> None:
         if "analysis" in today_df.columns:
             today_counts = sentiment_counts(today_df["analysis"])
 
-    filter_parts: list[str] = []
-    if time_range != "全部":
-        filter_parts.append(f"时间 {time_range}")
-    if display_scope != "全部":
-        filter_parts.append(f"类型 {display_scope}")
-    if keyword:
-        filter_parts.append(f"关键词“{keyword}”")
-    if selected_sources:
-        filter_parts.append(f"来源 {len(selected_sources)} 个")
-    filter_summary = " · ".join(filter_parts) if filter_parts else "默认（全部时间 · 全部类型）"
-
-    latest_cache_at = format_utc8_time(metadata["latest_fetched_at"])
     render_dashboard_header(
-        latest_cache_at=latest_cache_at,
-        selected_sectors=selected_sectors,
-        filter_summary=filter_summary,
         today_total=today_total,
         hot_count=len(hot_df),
         today_counts=today_counts,
@@ -1899,6 +2067,17 @@ def main() -> None:
         st.info("缓存暂无新闻。后台任务会定时抓取，也可以在“数据管理与高级设置”中手动刷新。")
     elif sector_cache_display_df.empty and external_display_df.empty:
         st.info("当前时间范围下暂无新闻。可以尝试扩大时间范围或选择更多板块。")
+
+    if stock_query.strip():
+        show_stock_search_section(
+            stock_query.strip(),
+            sector_cache_display_df,
+            external_display_df,
+            sectors_config,
+            selected_sources,
+            max_items,
+            hot_links,
+        )
 
     show_hot_news_section(hot_df, hot_used_fallback)
 
