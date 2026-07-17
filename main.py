@@ -601,6 +601,76 @@ def inject_styles() -> None:
             margin-top: 3px;
         }
 
+        /* ---- 侧边栏结构：眉题分组 + 轻量操作 + 扁平分组列表 ---- */
+        [data-testid="stSidebar"] .side-label {
+            border-top: 1px solid var(--line);
+            margin-top: 1.15rem;
+            padding-top: 0.95rem;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.16em;
+            color: var(--faint);
+        }
+
+        [data-testid="stSidebar"] .sector-status {
+            font-size: 12px;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+
+        [data-testid="stSidebar"] .st-key-sector_toolbar div.stButton > button {
+            width: 100%;
+            min-height: 1.7rem;
+            padding: 0.2rem 0.3rem;
+            border: none;
+            background: transparent;
+            color: var(--red);
+            font-size: 12.5px;
+            font-weight: 600;
+        }
+
+        [data-testid="stSidebar"] .st-key-sector_toolbar div.stButton > button:hover {
+            color: var(--red-deep);
+            background: transparent;
+            text-decoration: underline;
+        }
+
+        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stExpander"] {
+            border: 0;
+            border-bottom: 1px solid var(--line);
+            border-radius: 0;
+            background: transparent;
+        }
+
+        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stExpander"] details {
+            border: none;
+            background: transparent;
+        }
+
+        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stExpander"] summary {
+            padding: 0.5rem 0.15rem;
+        }
+
+        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stExpander"] summary:hover {
+            color: var(--red-deep);
+        }
+
+        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stCheckbox"] {
+            min-height: 1.55rem;
+        }
+
+        [data-testid="stSidebar"] [role="radiogroup"] {
+            gap: 0.25rem 0.9rem;
+            flex-wrap: wrap;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+        [data-testid="stSidebar"] [data-testid="stCaptionContainer"] * {
+            color: var(--faint);
+            font-size: 12.5px;
+        }
+
         @media (prefers-reduced-motion: reduce) {
             .news-card,
             div.stButton > button {
@@ -889,38 +959,60 @@ def render_sector_selector(sectors_config: dict[str, Any], sector_query: str) ->
         for sector, sector_keywords in sectors_config.items()
         if sector_matches_query(sector, sector_keywords, normalized_query)
     ]
-    selected_count = sum(
-        1
-        for sector in sectors_config
-        if st.session_state.get(f"sector_selected::{sector}", False)
-    )
-    st.sidebar.caption(
-        f"板块选择：已选 {selected_count} · 可见 {len(visible_sectors)} · 共 {len(sectors_config)}"
-    )
+    # 状态 + 全选/清空 放在同一行：状态是信息，操作降为文字钮。
+    # 先处理按钮点击再计算已选数，保证状态行反映本次操作的结果。
+    with st.sidebar.container(key="sector_toolbar"):
+        status_col, select_col, clear_col = st.columns(
+            [1.6, 0.7, 0.7], vertical_alignment="center"
+        )
+        if select_col.button("全选", key="select_all_sectors"):
+            for sector in sectors_config:
+                st.session_state[f"sector_selected::{sector}"] = True
+        if clear_col.button("清空", key="clear_all_sectors"):
+            for sector in sectors_config:
+                st.session_state[f"sector_selected::{sector}"] = False
+
+        selected_count = sum(
+            1
+            for sector in sectors_config
+            if st.session_state.get(f"sector_selected::{sector}", False)
+        )
+        if normalized_query:
+            status_text = f"匹配 {len(visible_sectors)} · 已选 {selected_count}"
+        else:
+            status_text = f"已选 {selected_count} / {len(sectors_config)} 个板块"
+        status_col.markdown(
+            f'<div class="sector-status">{escape(status_text)}</div>',
+            unsafe_allow_html=True,
+        )
 
     visible_set = set(visible_sectors)
     has_visible_group = False
-    for group_name, sectors in grouped_sectors(sectors_config):
-        visible_group_sectors = [sector for sector in sectors if sector in visible_set]
-        if not visible_group_sectors:
-            continue
+    with st.sidebar.container(key="sector_groups"):
+        for group_name, sectors in grouped_sectors(sectors_config):
+            visible_group_sectors = [
+                sector for sector in sectors if sector in visible_set
+            ]
+            if not visible_group_sectors:
+                continue
 
-        has_visible_group = True
-        selected_in_group = sum(
-            1
-            for sector in sectors
-            if st.session_state.get(f"sector_selected::{sector}", False)
-        )
-        expanded = bool(normalized_query) or selected_in_group > 0
-        with st.sidebar.expander(
-            f"{group_name}（{selected_in_group}/{len(sectors)}）",
-            expanded=expanded,
-        ):
-            for sector in visible_group_sectors:
-                st.checkbox(sector, key=f"sector_selected::{sector}")
+            has_visible_group = True
+            selected_in_group = sum(
+                1
+                for sector in sectors
+                if st.session_state.get(f"sector_selected::{sector}", False)
+            )
+            # 有选中的分组加粗，展开状态和计数一起把"选了什么"变得可扫读
+            label = f"{group_name} · {selected_in_group}/{len(sectors)}"
+            if selected_in_group:
+                label = f"**{label}**"
+            expanded = bool(normalized_query) or selected_in_group > 0
+            with st.expander(label, expanded=expanded):
+                for sector in visible_group_sectors:
+                    st.checkbox(sector, key=f"sector_selected::{sector}")
 
     if not has_visible_group:
-        st.sidebar.caption("没有匹配的板块。")
+        st.sidebar.caption("没有匹配的板块，换个词试试。")
 
     return visible_sectors
 
@@ -1947,27 +2039,21 @@ def main() -> None:
     if events_config_error:
         st.sidebar.warning(events_config_error)
 
-    if st.sidebar.button("重置筛选"):
-        reset_all_filters(sectors_config)
-
+    st.sidebar.markdown('<div class="side-label">个股</div>', unsafe_allow_html=True)
     stock_query = st.sidebar.text_input(
         "股票搜索",
         placeholder="股票代码或名称，如 600519 / 贵州茅台",
         key="stock_query",
-        help="搜索个股后，页面顶部会展示该股票的基本信息、关联板块及相关新闻",
+        label_visibility="collapsed",
     )
 
+    st.sidebar.markdown('<div class="side-label">关注板块</div>', unsafe_allow_html=True)
     sector_query = st.sidebar.text_input(
-        "板块搜索", placeholder="输入板块或关键词", key="sector_query"
+        "板块搜索",
+        placeholder="搜索板块或关键词",
+        key="sector_query",
+        label_visibility="collapsed",
     )
-    select_col, clear_col = st.sidebar.columns(2)
-    if select_col.button("全选板块"):
-        for sector in sectors_config:
-            st.session_state[f"sector_selected::{sector}"] = True
-    if clear_col.button("清空板块"):
-        for sector in sectors_config:
-            st.session_state[f"sector_selected::{sector}"] = False
-
     render_sector_selector(sectors_config, sector_query)
 
     selected_sectors = [
@@ -1976,20 +2062,20 @@ def main() -> None:
         if st.session_state.get(f"sector_selected::{sector}", False)
     ]
     if selected_sectors:
-        st.sidebar.markdown("当前已选：**" + "、".join(selected_sectors) + "**")
-    else:
-        st.sidebar.caption("尚未选择板块")
+        st.sidebar.caption("已选：" + "、".join(selected_sectors))
 
+    st.sidebar.markdown('<div class="side-label">新闻列表</div>', unsafe_allow_html=True)
     display_scope = st.sidebar.radio(
         "新闻类型",
         options=["全部", "板块新闻", "外部事件"],
         key="display_scope",
+        horizontal=True,
     )
     show_sector_news = display_scope in ("全部", "板块新闻")
     show_external_events = display_scope in ("全部", "外部事件")
-    time_range = st.sidebar.radio("时间范围", options=TIME_RANGE_OPTIONS, key="time_range")
-    if llm_notice:
-        st.sidebar.warning(llm_notice)
+    time_range = st.sidebar.radio(
+        "时间范围", options=TIME_RANGE_OPTIONS, key="time_range", horizontal=True
+    )
     keyword = st.sidebar.text_input(
         "关键词搜索", placeholder="标题、命中关键词、来源媒体", key="keyword_search"
     )
@@ -2001,6 +2087,13 @@ def main() -> None:
     )
 
     st.sidebar.divider()
+    # 重置放底部：先看筛选项，逃生舱最后；用回调避免在组件实例化后改状态
+    st.sidebar.button(
+        "重置全部筛选", on_click=reset_all_filters, args=(sectors_config,)
+    )
+    # 系统状态属于底部的高级设置区，不打断上方的筛选流
+    if llm_notice:
+        st.sidebar.caption(llm_notice)
     with st.sidebar.expander("数据管理与高级设置", expanded=False):
         keyword_tab, event_tab, data_tab = st.tabs(["关键词管理", "外部事件", "数据刷新"])
         with keyword_tab:
