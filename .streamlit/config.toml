@@ -1,0 +1,7 @@
+[theme]
+# 与 main.py inject_styles 中的设计 token 保持一致：
+# 纸面灰白底、暖墨字、市场红为主色（品牌色即"利好红"）
+primaryColor = "#b5372e"
+backgroundColor = "#f6f5f2"
+secondaryBackgroundColor = "#fbfaf7"
+textColor = "#23201c"
