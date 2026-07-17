@@ -98,25 +98,37 @@ def inject_styles() -> None:
     st.markdown(
         """
         <style>
+        /* ============================================================
+           设计语言：中文财经日报
+           纸面灰白底 + 暖墨字 + 市场红（品牌色即"利好红"）+ 盘面绿
+           报头与栏目标题用宋体，数字一律等宽对齐（红涨绿跌）
+           ============================================================ */
         :root {
-            --bg: #f8fafc;
+            --paper: #f6f5f2;
             --surface: #ffffff;
-            --surface-soft: #f3f4f6;
-            --border: #e5e7eb;
-            --border-strong: #d1d5db;
-            --text: #111827;
-            --muted: #6b7280;
-            --muted-soft: #9ca3af;
-            --accent: #2563eb;
-            --accent-soft: #eff6ff;
-            --success: #0f766e;
-            --warning: #92400e;
-            --warning-bg: #fffbeb;
+            --surface-soft: #f1efeb;
+            --line: #e5e1d8;
+            --line-strong: #cfc9be;
+            --ink: #23201c;
+            --ink-soft: #4c463f;
+            --muted: #6e675e;
+            --faint: #9b938a;
+            --red: #b5372e;
+            --red-deep: #96291f;
+            --red-soft: #f7ebe8;
+            --red-line: #e4c4bf;
+            --green: #2e7d4f;
+            --green-soft: #eaf2ec;
+            --green-line: #c4dbcc;
+            --amber: #96660f;
+            --amber-soft: #f7efdb;
+            --amber-line: #e6d3a8;
+            --serif: "Songti SC", "Noto Serif SC", "STSong", "SimSun", serif;
         }
 
         .stApp {
-            background: var(--bg);
-            color: var(--text);
+            background: var(--paper);
+            color: var(--ink);
         }
 
         header[data-testid="stHeader"] {
@@ -154,53 +166,54 @@ def inject_styles() -> None:
         }
 
         [data-testid="stSidebar"] {
-            background: #ffffff;
-            border-right: 1px solid var(--border);
+            background: #fbfaf7;
+            border-right: 1px solid var(--line);
             min-width: 292px !important;
             max-width: 320px !important;
         }
 
         [data-testid="stSidebar"] * {
-            color: var(--text);
+            color: var(--ink);
             letter-spacing: 0;
             font-size: 14px;
         }
 
         [data-testid="stSidebar"] h2,
         [data-testid="stSidebar"] h3 {
-            font-size: 1rem;
+            font-family: var(--serif);
+            font-size: 1.02rem;
             font-weight: 700;
-            color: #111827;
+            color: var(--ink);
             margin-bottom: 0.5rem;
         }
 
         [data-testid="stSidebar"] [data-baseweb="tag"] {
-            background-color: #e0f2fe;
-            border: 1px solid #bae6fd;
-            color: #0f172a;
+            background-color: var(--red-soft);
+            border: 1px solid var(--red-line);
+            color: var(--red-deep);
             font-weight: 600;
         }
 
         [data-testid="stSidebar"] [data-baseweb="tag"] span {
-            color: #0f172a;
+            color: var(--red-deep);
         }
 
         [data-baseweb="select"] > div,
         [data-baseweb="input"] > div {
-            background: #ffffff;
-            border-color: var(--border);
-            border-radius: 8px;
+            background: var(--surface);
+            border-color: var(--line);
+            border-radius: 3px;
             box-shadow: none;
         }
 
         [data-baseweb="select"] > div:hover,
         [data-baseweb="input"] > div:hover {
-            border-color: var(--border-strong);
+            border-color: var(--line-strong);
         }
 
         [data-testid="stSlider"] [role="slider"] {
-            background: var(--accent);
-            border-color: var(--accent);
+            background: var(--red);
+            border-color: var(--red);
         }
 
         [data-testid="stCheckbox"] {
@@ -209,95 +222,151 @@ def inject_styles() -> None:
 
         [data-testid="stCheckbox"] label {
             gap: 0.35rem;
-            color: var(--text);
+            color: var(--ink);
             font-size: 0.9rem;
         }
 
         [data-testid="stCheckbox"] div[role="checkbox"] {
-            border-color: #cbd5e1 !important;
+            border-color: var(--line-strong) !important;
         }
 
         [data-testid="stCheckbox"] div[role="checkbox"][aria-checked="true"] {
-            background-color: var(--accent) !important;
-            border-color: var(--accent) !important;
+            background-color: var(--red) !important;
+            border-color: var(--red) !important;
         }
 
         div.stButton > button {
             width: 100%;
-            border: 1px solid var(--border-strong);
-            border-radius: 8px;
-            background: #ffffff;
-            color: #111827;
+            border: 1px solid var(--line-strong);
+            border-radius: 3px;
+            background: var(--surface);
+            color: var(--ink);
             box-shadow: none;
             font-weight: 600;
+            transition: border-color 120ms ease, color 120ms ease;
         }
 
         div.stButton > button:hover {
-            border-color: #9ca3af;
-            background: #f9fafb;
-            color: #111827;
+            border-color: var(--red);
+            background: var(--surface);
+            color: var(--red-deep);
         }
 
-        .dashboard-header {
+        div.stButton > button:focus-visible,
+        a:focus-visible {
+            outline: 2px solid var(--red);
+            outline-offset: 2px;
+        }
+
+        /* ---- 报头 ---- */
+        .masthead {
+            border-bottom: 4px double var(--line-strong);
+            margin-bottom: 1.1rem;
+        }
+
+        .masthead-top {
             display: flex;
             justify-content: space-between;
-            align-items: flex-start;
-            gap: 1.5rem;
-            padding: 0.2rem 0 1rem;
-            margin-bottom: 0.75rem;
-            border-bottom: 1px solid var(--border);
+            align-items: baseline;
+            gap: 1rem;
+            padding: 0.2rem 0 0.7rem;
         }
 
-        .dashboard-title {
-            margin: 0;
-            font-size: 24px;
+        .masthead-title {
+            font-family: var(--serif);
+            font-size: 30px;
+            font-weight: 900;
+            letter-spacing: 0.06em;
             line-height: 1.2;
-            letter-spacing: 0;
-            color: var(--text);
-            font-weight: 650;
+            color: var(--ink);
         }
 
-        .dashboard-subtitle {
-            margin-top: 0.35rem;
+        .masthead-date {
+            font-size: 13px;
             color: var(--muted);
-            font-size: 0.95rem;
+            white-space: nowrap;
+            font-variant-numeric: tabular-nums;
         }
 
+        .ticker-strip {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            border-top: 1px solid var(--line);
+            padding: 0.6rem 0 0.7rem;
+        }
+
+        .ticker-strip .stat {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 0.45rem;
+            padding: 0 1.15rem;
+            border-right: 1px solid var(--line);
+        }
+
+        .ticker-strip .stat:first-child {
+            padding-left: 0;
+        }
+
+        .ticker-strip .stat:last-child {
+            border-right: 0;
+        }
+
+        .stat-label {
+            font-size: 0.78rem;
+            color: var(--muted);
+            white-space: nowrap;
+        }
+
+        .stat-num {
+            font-size: 1.18rem;
+            font-weight: 700;
+            color: var(--ink);
+            font-variant-numeric: tabular-nums;
+            line-height: 1.2;
+        }
+
+        .stat-num.up { color: var(--red); }
+        .stat-num.down { color: var(--green); }
+
+        /* ---- 个股信息卡片的指标格 ---- */
         .metric-grid {
             display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
-            gap: 0.55rem;
-            min-width: 620px;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0;
+            border-top: 1px solid var(--line);
         }
 
         .metric-card {
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            background: var(--surface);
-            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-            padding: 0.72rem 0.82rem;
+            padding: 0.6rem 0.95rem;
+            border-right: 1px solid var(--line);
+        }
+
+        .metric-card:last-child {
+            border-right: 0;
         }
 
         .metric-label {
             color: var(--muted);
             font-size: 0.75rem;
-            margin-bottom: 0.25rem;
+            margin-bottom: 0.15rem;
             white-space: nowrap;
         }
 
         .metric-value {
-            color: var(--text);
-            font-size: 1.06rem;
+            color: var(--ink);
+            font-size: 1.02rem;
             font-weight: 700;
+            font-variant-numeric: tabular-nums;
         }
 
+        /* ---- 板块区块 ---- */
         .sector-section {
             background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 8px;
+            border: 1px solid var(--line);
+            border-radius: 3px;
             margin: 0.8rem 0 1rem;
             overflow: hidden;
-            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
         }
 
         .sector-heading {
@@ -305,16 +374,19 @@ def inject_styles() -> None:
             align-items: center;
             justify-content: space-between;
             gap: 1rem;
-            padding: 0.82rem 0.95rem;
-            border-bottom: 1px solid var(--border);
-            background: #fbfdff;
+            padding: 0.78rem 0.95rem;
+            border-bottom: 1px solid var(--line);
         }
 
         .sector-name {
-            color: var(--text);
-            font-size: 18px;
-            font-weight: 600;
+            font-family: var(--serif);
+            color: var(--ink);
+            font-size: 19px;
+            font-weight: 700;
             overflow-wrap: anywhere;
+            border-left: 3px solid var(--red);
+            padding-left: 10px;
+            line-height: 1.3;
         }
 
         .sector-meta {
@@ -328,24 +400,25 @@ def inject_styles() -> None:
             display: inline-flex;
             align-items: center;
             border-radius: 999px;
-            border: 1px solid var(--border);
-            background: #f9fafb;
+            border: 1px solid var(--line);
+            background: var(--paper);
             color: var(--muted);
             padding: 0.18rem 0.52rem;
             font-size: 0.75rem;
             white-space: nowrap;
+            font-variant-numeric: tabular-nums;
         }
 
         .pill.warn {
-            border-color: #fde68a;
-            background: var(--warning-bg);
-            color: var(--warning);
+            border-color: var(--amber-line);
+            background: var(--amber-soft);
+            color: var(--amber);
         }
 
         .section-warning {
-            color: var(--warning);
-            background: var(--warning-bg);
-            border-bottom: 1px solid #fde68a;
+            color: var(--amber);
+            background: var(--amber-soft);
+            border-bottom: 1px solid var(--amber-line);
             padding: 0.62rem 0.95rem;
             font-size: 0.82rem;
             overflow-wrap: anywhere;
@@ -356,7 +429,7 @@ def inject_styles() -> None:
         }
 
         .news-card {
-            border-bottom: 1px solid var(--border);
+            border-bottom: 1px solid var(--line);
             background: var(--surface);
             padding: 14px 16px;
             transition: background-color 120ms ease;
@@ -367,14 +440,14 @@ def inject_styles() -> None:
         }
 
         .news-card:hover {
-            background: #f9fafb;
+            background: #fbfaf7;
         }
 
         .news-title {
             margin: 0 0 6px;
-            color: var(--text);
-            font-size: 18px;
-            line-height: 1.45;
+            color: var(--ink);
+            font-size: 17px;
+            line-height: 1.5;
             font-weight: 600;
             overflow-wrap: anywhere;
             word-break: break-word;
@@ -392,13 +465,14 @@ def inject_styles() -> None:
             color: var(--muted);
             font-size: 12px;
             line-height: 1.5;
+            font-variant-numeric: tabular-nums;
         }
 
         .keyword-tag {
-            border-radius: 6px;
-            background: var(--accent-soft);
-            border: 1px solid #dbeafe;
-            color: #1d4ed8;
+            border-radius: 3px;
+            background: var(--surface-soft);
+            border: 1px solid var(--line);
+            color: var(--ink-soft);
             padding: 1px 6px;
             font-size: 12px;
             font-weight: 500;
@@ -406,26 +480,28 @@ def inject_styles() -> None:
 
         .news-link {
             margin-left: auto;
-            color: var(--accent) !important;
+            color: var(--red) !important;
             text-decoration: none !important;
             font-weight: 600;
             white-space: nowrap;
         }
 
         .news-link:hover {
+            color: var(--red-deep) !important;
             text-decoration: underline !important;
         }
 
         .empty-state {
             padding: 0.9rem 0.95rem;
             color: var(--muted);
-            background: #ffffff;
+            background: var(--surface);
         }
 
+        /* ---- 标签：红=利好，绿=利空，琥珀=高影响 ---- */
         .tag {
             display: inline-flex;
             align-items: center;
-            border-radius: 4px;
+            border-radius: 3px;
             padding: 1px 8px;
             font-size: 12px;
             font-weight: 600;
@@ -434,16 +510,16 @@ def inject_styles() -> None:
             white-space: nowrap;
         }
 
-        .tag-pos { background: #fdeaea; color: #c02b2b; border-color: #f5c6c6; }
-        .tag-neg { background: #e7f4ec; color: #1e7f43; border-color: #c3e5d0; }
-        .tag-neu { background: #eef1f5; color: #5b6675; border-color: #dbe1e8; }
-        .tag-impact-high { background: #fff7e6; color: #b45309; border-color: #fde68a; }
-        .tag-impact-medium { background: #f4f6f8; color: #6b7280; border-color: #e5e7eb; }
-        .tag-impact-low { background: #f9fafb; color: #9ca3af; border-color: #eceff2; }
-        .tag-hot { background: #fff1f0; color: #c0392b; border-color: #fbc4c0; }
-        .tag-cat-policy { background: #eff6ff; color: #1d4ed8; border-color: #dbeafe; }
-        .tag-cat-stock_move { background: #f9fafb; color: #9ca3af; border-color: #eceff2; }
-        .tag-low-conf { background: #fffbeb; color: #92400e; border-color: #fde68a; }
+        .tag-pos { background: var(--red-soft); color: var(--red-deep); border-color: var(--red-line); }
+        .tag-neg { background: var(--green-soft); color: var(--green); border-color: var(--green-line); }
+        .tag-neu { background: var(--surface-soft); color: var(--muted); border-color: var(--line); }
+        .tag-impact-high { background: var(--amber-soft); color: var(--amber); border-color: var(--amber-line); }
+        .tag-impact-medium { background: var(--surface-soft); color: var(--muted); border-color: var(--line); }
+        .tag-impact-low { background: transparent; color: var(--faint); border-color: var(--line); }
+        .tag-hot { background: var(--red); color: #ffffff; border-color: var(--red); }
+        .tag-cat-policy { background: transparent; color: var(--ink-soft); border-color: var(--line-strong); }
+        .tag-cat-stock_move { background: transparent; color: var(--faint); border-color: var(--line); }
+        .tag-low-conf { background: var(--amber-soft); color: var(--amber); border-color: var(--amber-line); }
 
         details.related-reports {
             margin-top: 6px;
@@ -453,7 +529,7 @@ def inject_styles() -> None:
 
         details.related-reports summary {
             cursor: pointer;
-            color: var(--accent);
+            color: var(--red);
             font-weight: 500;
         }
 
@@ -466,12 +542,12 @@ def inject_styles() -> None:
         }
 
         .related-item a {
-            color: #374151 !important;
+            color: var(--ink-soft) !important;
             text-decoration: none !important;
         }
 
         .related-item a:hover {
-            color: var(--accent) !important;
+            color: var(--red) !important;
             text-decoration: underline !important;
         }
 
@@ -488,65 +564,70 @@ def inject_styles() -> None:
             align-items: baseline;
             gap: 12px;
             flex-wrap: wrap;
-            color: #374151;
+            color: var(--ink-soft);
             font-size: 13px;
             margin-top: 7px;
         }
 
         .section-title {
-            font-size: 18px;
-            font-weight: 650;
-            color: var(--text);
-            margin: 1.1rem 0 0.15rem;
+            font-family: var(--serif);
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--ink);
+            margin: 1.2rem 0 0.15rem;
         }
 
         .hot-card {
-            border: 1px solid var(--border);
-            border-left: 3px solid var(--accent);
-            border-radius: 8px;
+            border: 1px solid var(--line);
+            border-left: 3px solid var(--red);
+            border-radius: 3px;
             background: var(--surface);
             padding: 14px 16px;
             margin-bottom: 0.6rem;
-            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
         }
 
         .hot-title {
-            font-size: 19px;
+            font-size: 18px;
             font-weight: 650;
-            color: var(--text);
+            color: var(--ink);
             margin: 6px 0 4px;
-            line-height: 1.4;
+            line-height: 1.45;
             overflow-wrap: anywhere;
         }
 
         .hot-sectors {
-            color: #374151;
+            color: var(--ink-soft);
             font-size: 13px;
             margin-top: 3px;
         }
 
-        .filter-status {
-            margin-top: 0.55rem;
-            color: var(--muted);
-            font-size: 13px;
-            line-height: 1.8;
-        }
-
-        .filter-status b {
-            color: #374151;
-            font-weight: 600;
+        @media (prefers-reduced-motion: reduce) {
+            .news-card,
+            div.stButton > button {
+                transition: none;
+            }
         }
 
         @media (max-width: 900px) {
-            .dashboard-header {
+            .masthead-top {
                 flex-direction: column;
+                gap: 0.2rem;
+            }
+
+            .ticker-strip .stat {
+                padding: 0 0.8rem;
             }
 
             .metric-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 0.45rem;
-                min-width: 0;
-                width: 100%;
+            }
+
+            .metric-card:nth-child(2n) {
+                border-right: 0;
+            }
+
+            .metric-card:nth-child(-n+2) {
+                border-bottom: 1px solid var(--line);
             }
 
             .sector-heading {
@@ -569,41 +650,27 @@ def inject_styles() -> None:
                 max-width: 300px !important;
             }
 
-            .dashboard-header {
-                gap: 0.75rem;
-                padding-bottom: 0.85rem;
+            .masthead-title {
+                font-size: 24px;
             }
 
-            .dashboard-title {
-                font-size: 22px;
+            .ticker-strip {
+                gap: 0.3rem 0;
             }
 
-            .dashboard-subtitle {
-                font-size: 13px;
-            }
-
-            .metric-card {
-                padding: 7px 10px;
-            }
-
-            .metric-label {
+            .stat-label {
                 font-size: 11px;
-                margin-bottom: 2px;
             }
 
-            .metric-value {
-                font-size: 14px;
+            .stat-num {
+                font-size: 1rem;
             }
 
             .hot-title {
-                font-size: 17px;
+                font-size: 16px;
             }
 
             .news-reason {
-                font-size: 12px;
-            }
-
-            .filter-status {
                 font-size: 12px;
             }
 
@@ -626,8 +693,8 @@ def inject_styles() -> None:
             }
 
             .news-title {
-                font-size: 16px;
-                line-height: 1.45;
+                font-size: 15px;
+                line-height: 1.5;
                 -webkit-line-clamp: 3;
             }
 
@@ -1045,7 +1112,7 @@ def render_news_item(
             </div>
             <div class="news-reason">
                 <span>判断：{reason}</span>
-                <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">打开原文</a>
+                <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">查看原文</a>
             </div>
             {related_reports_html(related_rows or [])}
         </article>
@@ -1079,7 +1146,7 @@ def render_external_event_item(
             </div>
             <div class="news-reason">
                 <span>判断：{reason}</span>
-                <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">打开原文</a>
+                <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">查看原文</a>
             </div>
             {related_reports_html(related_rows or [])}
         </article>
@@ -1337,7 +1404,7 @@ def render_stock_profile_card(profile: StockProfile, related_sectors: list[str])
         f"""
         <section class="sector-section">
             <div class="sector-heading">
-                <div class="sector-name">📈 {escape(profile.name)}（{escape(profile.code)}）</div>
+                <div class="sector-name">{escape(profile.name)}（{escape(profile.code)}）</div>
                 <div class="sector-meta">{quote_tags}</div>
             </div>
             {warning_html}
@@ -1511,34 +1578,35 @@ def render_dashboard_header(
     hot_count: int,
     today_counts: dict[str, int],
 ) -> None:
+    now = now_utc8_naive()
+    weekday_names = "一二三四五六日"
+    date_text = (
+        f"{now.year}年{now.month}月{now.day}日 · 星期{weekday_names[now.weekday()]}"
+    )
+    stats = [
+        ("今日新闻", today_total, ""),
+        ("今日热点", hot_count, ""),
+        ("利好", today_counts.get("positive", 0), "up"),
+        ("中性", today_counts.get("neutral", 0), ""),
+        ("利空", today_counts.get("negative", 0), "down"),
+    ]
+    stats_html = "".join(
+        f"""
+        <span class="stat">
+            <span class="stat-label">{escape(label)}</span>
+            <span class="stat-num {css_class}">{value}</span>
+        </span>
+        """
+        for label, value, css_class in stats
+    )
     st.markdown(
         f"""
-        <section class="dashboard-header">
-            <div>
-                <div class="dashboard-title">A股板块新闻</div>
+        <section class="masthead">
+            <div class="masthead-top">
+                <div class="masthead-title">A股板块新闻</div>
+                <div class="masthead-date">{escape(date_text)}</div>
             </div>
-            <div class="metric-grid">
-                <div class="metric-card">
-                    <div class="metric-label">今日新闻</div>
-                    <div class="metric-value">{today_total}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">今日热点</div>
-                    <div class="metric-value">{hot_count}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">利好</div>
-                    <div class="metric-value">{today_counts.get("positive", 0)}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">中性</div>
-                    <div class="metric-value">{today_counts.get("neutral", 0)}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-label">利空</div>
-                    <div class="metric-value">{today_counts.get("negative", 0)}</div>
-                </div>
-            </div>
+            <div class="ticker-strip">{stats_html}</div>
         </section>
         """,
         unsafe_allow_html=True,

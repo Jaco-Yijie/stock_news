@@ -3,3 +3,6 @@ __pycache__/
 .DS_Store
 data/news_cache.csv
 .env
+.agents/
+.claude/
+skills-lock.json
