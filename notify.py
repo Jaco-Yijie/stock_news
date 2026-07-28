@@ -1,6 +1,7 @@
-"""推送通道：Server酱 / PushPlus（微信）、Telegram。
+"""推送通道：Telegram / PushPlus（微信）。
 
 - 通道由环境变量决定，配了哪个用哪个，都未配置时静默跳过；
+- 各通道自己渲染消息：Telegram 用 HTML，PushPlus 用 markdown；
 - 推送历史（链接指纹）保存在 Supabase app_config / 本地文件，避免重复推送；
 - 只推"政策类或高影响"的新闻，且限制单次条数，避免刷屏。
 """
@@ -33,6 +34,10 @@ PUSH_WINDOW_HOURS = 24
 PUSH_HISTORY_KEY = "push_history"
 PUSH_HISTORY_PATH = DATA_DIR / "push_history.json"
 PUSH_HISTORY_LIMIT = 800
+# Telegram 单条消息上限 4096 字符，留出标题和分段标记的余量
+TELEGRAM_MESSAGE_LIMIT = 3800
+# 标题过长会让单个条目块超过分段上限，硬切可能切坏 HTML 标签，先在源头截断
+MAX_TITLE_CHARS = 200
 
 
 def _clean_secret(value: str) -> str:
@@ -47,31 +52,15 @@ def _ensure_http_ok(response: requests.Response, channel: str) -> None:
         )
 
 
-class ServerChanNotifier:
-    name = "Server酱"
-
-    def __init__(self, sendkey: str, timeout: int = DEFAULT_TIMEOUT) -> None:
-        self._url = f"https://sctapi.ftqq.com/{sendkey}.send"
-        self._timeout = timeout
-
-    def send(self, title: str, content: str) -> None:
-        response = requests.post(
-            self._url,
-            data={"title": title[:32], "desp": content},
-            timeout=self._timeout,
-        )
-        _ensure_http_ok(response, self.name)
-        payload = response.json()
-        if payload.get("code") not in (0, 200):
-            raise RuntimeError(f"Server酱返回错误：{str(payload)[:200]}")
-
-
 class PushPlusNotifier:
     name = "PushPlus"
 
     def __init__(self, token: str, timeout: int = DEFAULT_TIMEOUT) -> None:
         self._token = token
         self._timeout = timeout
+
+    def render(self, df: pd.DataFrame, overview: str = "") -> str:
+        return format_push_markdown(df, overview)
 
     def send(self, title: str, content: str) -> None:
         response = requests.post(
@@ -98,39 +87,60 @@ class TelegramNotifier:
         self._chat_id = chat_id
         self._timeout = timeout
 
+    def render(self, df: pd.DataFrame, overview: str = "") -> str:
+        return format_push_html(df, overview)
+
     def send(self, title: str, content: str) -> None:
-        response = requests.post(
-            self._url,
-            json={"chat_id": self._chat_id, "text": f"{title}\n\n{content}"},
-            timeout=self._timeout,
-        )
-        _ensure_http_ok(response, self.name)
-        payload = response.json()
-        if not payload.get("ok"):
-            raise RuntimeError(f"Telegram 返回错误：{str(payload)[:200]}")
+        """按 Telegram 的 4096 字符上限分段发送。
+
+        用 HTML 而不是 MarkdownV2：中文标题里的 ()、-、.、! 等字符在
+        MarkdownV2 里都必须转义，漏一个就是 400；HTML 只需处理 & < >。
+        """
+        body = f"<b>{_escape_html(title)}</b>\n\n{content}".strip()
+        chunks = _split_for_telegram(body)
+        total = len(chunks)
+        for index, chunk in enumerate(chunks, start=1):
+            text = chunk if total == 1 else f"{chunk}\n\n（{index}/{total}）"
+            response = requests.post(
+                self._url,
+                json={
+                    "chat_id": self._chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    # 十几条新闻各带一个链接，预览卡片会把消息撑得没法看
+                    "disable_web_page_preview": True,
+                },
+                timeout=self._timeout,
+            )
+            _ensure_http_ok(response, self.name)
+            payload = response.json()
+            if not payload.get("ok"):
+                raise RuntimeError(f"Telegram 返回错误：{str(payload)[:200]}")
 
 
 def load_notifiers_from_env() -> list[Any]:
     notifiers: list[Any] = []
-    sendkey = _clean_secret(os.getenv("SERVERCHAN_SENDKEY", ""))
-    if sendkey:
-        notifiers.append(ServerChanNotifier(sendkey))
-    pushplus_token = _clean_secret(os.getenv("PUSHPLUS_TOKEN", ""))
-    if pushplus_token:
-        notifiers.append(PushPlusNotifier(pushplus_token))
     telegram_token = _clean_secret(os.getenv("TELEGRAM_BOT_TOKEN", ""))
     telegram_chat = _clean_secret(os.getenv("TELEGRAM_CHAT_ID", ""))
     if telegram_token and telegram_chat:
         notifiers.append(TelegramNotifier(telegram_token, telegram_chat))
+    pushplus_token = _clean_secret(os.getenv("PUSHPLUS_TOKEN", ""))
+    if pushplus_token:
+        notifiers.append(PushPlusNotifier(pushplus_token))
     return notifiers
 
 
-def send_to_all(notifiers: list[Any], title: str, content: str) -> list[str]:
-    """向所有通道发送，返回失败信息列表（全部成功时为空）。"""
+def send_to_all(
+    notifiers: list[Any],
+    title: str,
+    df: pd.DataFrame,
+    overview: str = "",
+) -> list[str]:
+    """让每个通道按自己的格式渲染并发送，返回失败信息列表（全部成功时为空）。"""
     errors: list[str] = []
     for notifier in notifiers:
         try:
-            notifier.send(title, content)
+            notifier.send(title, notifier.render(df, overview))
         except Exception as exc:
             errors.append(f"{notifier.name}: {exc}")
     return errors
@@ -216,15 +226,30 @@ def hashes_for(df: pd.DataFrame) -> list[str]:
     return [_link_hash(link) for link in df["原文链接"].astype(str)]
 
 
-def _format_line(row: pd.Series) -> str:
+def _escape_html(value: Any) -> str:
+    """Telegram HTML 模式只把 & < > 当特殊字符，转义这三个即可。"""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _row_fields(row: pd.Series) -> tuple[str, str, str, str, str, str]:
     analysis = row.get("analysis") if isinstance(row.get("analysis"), dict) else {}
     sentiment = SENTIMENT_LABELS.get(analysis.get("sentiment", "neutral"), "中性")
     sector = str(row.get("sector", "") or "").strip()
     sectors = sector or "、".join(list(analysis.get("sector_assessments") or {})[:3]) or "-"
-    title = str(row.get("标题", "")).strip()
+    title = str(row.get("标题", "")).strip()[:MAX_TITLE_CHARS]
     source = str(row.get("来源媒体", "")).strip()
     publish_time = str(row.get("发布时间", "")).strip()
     link = str(row.get("原文链接", "")).strip()
+    return sentiment, sectors, title, source, publish_time, link
+
+
+def _format_line(row: pd.Series) -> str:
+    sentiment, sectors, title, source, publish_time, link = _row_fields(row)
     return (
         f"**【{sentiment}】{title}**\n"
         f"板块：{sectors} ｜ {source} {publish_time}\n"
@@ -232,8 +257,52 @@ def _format_line(row: pd.Series) -> str:
     )
 
 
-def format_push_markdown(df: pd.DataFrame) -> str:
-    return "\n\n".join(_format_line(row) for _, row in df.iterrows())
+def _format_line_html(row: pd.Series) -> str:
+    sentiment, sectors, title, source, publish_time, link = _row_fields(row)
+    return (
+        f"<b>【{sentiment}】{_escape_html(title)}</b>\n"
+        f"板块：{_escape_html(sectors)} ｜ {_escape_html(source)} "
+        f"{_escape_html(publish_time)}\n"
+        f'<a href="{_escape_html(link)}">原文</a>'
+    )
+
+
+def _join_blocks(overview: str, blocks: list[str], separator: str) -> str:
+    parts = [block for block in blocks if block]
+    if overview:
+        parts = [overview, separator, *parts]
+    return "\n\n".join(parts)
+
+
+def format_push_markdown(df: pd.DataFrame, overview: str = "") -> str:
+    blocks = [_format_line(row) for _, row in df.iterrows()]
+    return _join_blocks(overview.strip(), blocks, "---")
+
+
+def format_push_html(df: pd.DataFrame, overview: str = "") -> str:
+    blocks = [_format_line_html(row) for _, row in df.iterrows()]
+    return _join_blocks(_escape_html(overview.strip()) if overview else "", blocks, "———")
+
+
+def _split_for_telegram(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    """按空行边界切分，保证不切开单个条目（也就不会切坏 HTML 标签）。"""
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        # 单块自身超限只可能是 LLM 总览那种纯文本，硬切不会破坏标签
+        while len(block) > limit:
+            chunks.append(block[:limit])
+            block = block[limit:]
+        current = block
+    if current:
+        chunks.append(current)
+    return chunks or [text]
 
 
 def _prepare_display(cache_df: pd.DataFrame) -> pd.DataFrame:
@@ -264,7 +333,7 @@ def push_important_news(cache_df: pd.DataFrame) -> None:
 
     now = now_utc8_naive()
     title = f"板块要闻 {len(fresh)} 条 · {now.strftime('%m-%d %H:%M')}"
-    errors = send_to_all(notifiers, title, format_push_markdown(fresh))
+    errors = send_to_all(notifiers, title, fresh)
     for error in errors:
         print(f"[warning] 推送失败 {error}")
     if len(errors) < len(notifiers):
@@ -317,12 +386,9 @@ def push_daily_report(cache_df: pd.DataFrame, llm_verifier: Any = None) -> None:
             overview = ""
 
     now = now_utc8_naive()
-    title = f"A股板块早报 {now.strftime('%m-%d')}"
-    content = format_push_markdown(top_df)
-    if overview:
-        content = f"{overview}\n\n---\n\n{content}"
+    title = f"板块早报 {now.strftime('%m-%d')}"
 
-    errors = send_to_all(notifiers, title, content)
+    errors = send_to_all(notifiers, title, top_df, overview)
     for error in errors:
         print(f"[warning] 早报推送失败 {error}")
     if len(errors) < len(notifiers):

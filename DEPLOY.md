@@ -157,15 +157,25 @@ python refresh_job.py --mode incremental --retention-days 60
 - **重要新闻即时推送**：每次定时抓取后，把新增的"政策类或高影响"新闻推送出去（已推送过的不重复推，单次最多 8 条）；
 - **每日早报**：每天北京时间约 07:30，推送最近 24 小时按重要性排序的要闻 Top 榜；配置了 LLM 时附 3-5 句总览。
 
-支持三种通道，配置任意一种即可（都配置则同时推送）。在 GitHub 仓库 → Settings → Secrets and variables → Actions 中添加：
+推送通道以 **Telegram 为主**。在 GitHub 仓库 → Settings → Secrets and variables → Actions 中添加：
 
 | 通道 | Secret | 获取方式 |
 |---|---|---|
-| Server酱（微信） | `SERVERCHAN_SENDKEY` | [sct.ftqq.com](https://sct.ftqq.com) 微信扫码登录后复制 SendKey |
-| PushPlus（微信） | `PUSHPLUS_TOKEN` | [pushplus.plus](https://www.pushplus.plus) 微信扫码登录后复制 token |
-| Telegram | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | @BotFather 创建机器人取 token；@userinfobot 查自己的 chat id |
+| Telegram | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | 见下方步骤 |
+| PushPlus（微信，可选） | `PUSHPLUS_TOKEN` | [pushplus.plus](https://www.pushplus.plus) 微信扫码登录后复制 token |
 
-不配置任何通道时，推送步骤自动跳过，不影响抓取。临时关闭推送可在 workflow 命令中加 `--no-notify`。
+两个都配则同时推送；都不配时推送步骤自动跳过，不影响抓取。临时关闭推送可在 workflow 命令中加 `--no-notify`。
+
+#### 配置 Telegram
+
+1. 在 Telegram 里找 **@BotFather**，发 `/newbot`，按提示起名，拿到形如 `123456789:AAH...` 的 token → 存成 `TELEGRAM_BOT_TOKEN`。
+2. **给你刚建的机器人发一条任意消息**（这一步不能省，否则机器人无权给你发消息，会报 `403 Forbidden: bot can't initiate conversation with a user`）。
+3. 找 **@userinfobot** 发 `/start`，它会回你的数字 ID → 存成 `TELEGRAM_CHAT_ID`。
+4. 想推到群里就把机器人拉进群，群的 chat id 是**负数**（形如 `-1001234567890`），可以用 `https://api.telegram.org/bot<TOKEN>/getUpdates` 查。
+
+配好后可以在 Actions 页面手动触发一次 `Daily report`（workflow_dispatch）验证，日志会打印推送结果。
+
+消息用 Telegram 的 HTML 模式渲染，超过 4096 字符会自动分段发送。
 
 ### 注意事项
 
