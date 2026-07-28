@@ -128,6 +128,11 @@ export SUPABASE_KEY="service_role key"
 
 如需在后台抓取中启用 LLM 反向校验，再添加 `LLM_VERIFY_PROVIDER` 和对应的 `DOUBAO_*` / `DEEPSEEK_*`。不加则跳过 LLM 校验，只用规则过滤。
 
+两个超时参数可选，通常不用改：
+
+- `LLM_VERIFY_TIMEOUT`（默认 8 秒）：新闻分类校验，只回一小段 JSON。
+- `LLM_COMPLETE_TIMEOUT`（默认 90 秒）：「今日板块日报」生成整段中文，输入约 1500 token、输出 200+ token，慢的模型要几十秒。如果日报仍提示调用超时，把这个值调大。
+
 ### 2. 抓取频率
 
 `.github/workflows/refresh-news.yml` 中的默认排程（北京时间）：

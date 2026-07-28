@@ -2,6 +2,7 @@ from html import escape
 from typing import Any
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from classifier import LLMVerifier, extract_rule_keywords
@@ -47,18 +48,10 @@ from news_store import (
 )
 from refresh import run_full_refresh, run_incremental_refresh
 from sectors import SECTORS as DEFAULT_SECTORS
-from stock_search import (
-    StockProfile,
-    fetch_stock_profile,
-    format_market_cap,
-    load_stock_list,
-    match_sectors_for_stock,
-    search_stocks,
-)
 from time_utils import now_utc8_naive
 
 
-st.set_page_config(page_title="A股板块新闻", page_icon="📰", layout="wide")
+st.set_page_config(page_title="板块新闻", page_icon="📰", layout="wide")
 DEFAULT_SELECTED_SECTORS = ("半导体芯片",)
 TIME_RANGE_OPTIONS = ("全部", "今天", "近 3 天", "本周")
 SECTOR_GROUPS: dict[str, tuple[str, ...]] = {
@@ -328,37 +321,6 @@ def inject_styles() -> None:
 
         .stat-num.up { color: var(--red); }
         .stat-num.down { color: var(--green); }
-
-        /* ---- 个股信息卡片的指标格 ---- */
-        .metric-grid {
-            display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 0;
-            border-top: 1px solid var(--line);
-        }
-
-        .metric-card {
-            padding: 0.6rem 0.95rem;
-            border-right: 1px solid var(--line);
-        }
-
-        .metric-card:last-child {
-            border-right: 0;
-        }
-
-        .metric-label {
-            color: var(--muted);
-            font-size: 0.75rem;
-            margin-bottom: 0.15rem;
-            white-space: nowrap;
-        }
-
-        .metric-value {
-            color: var(--ink);
-            font-size: 1.02rem;
-            font-weight: 700;
-            font-variant-numeric: tabular-nums;
-        }
 
         /* ---- 板块区块 ---- */
         .sector-section {
@@ -688,18 +650,6 @@ def inject_styles() -> None:
                 padding: 0 0.8rem;
             }
 
-            .metric-grid {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-            }
-
-            .metric-card:nth-child(2n) {
-                border-right: 0;
-            }
-
-            .metric-card:nth-child(-n+2) {
-                border-bottom: 1px solid var(--line);
-            }
-
             .sector-heading {
                 align-items: flex-start;
                 flex-direction: column;
@@ -849,18 +799,6 @@ def load_display_data(
         cache_result.error,
         refilter_warnings,
     )
-
-
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def cached_stock_list() -> list[tuple[str, str]]:
-    """A 股代码-名称列表，每天最多拉取一次；失败时退回内置列表。"""
-    return load_stock_list()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_stock_profile(code: str, name: str) -> StockProfile:
-    """个股基本信息与实时行情，5 分钟内复用。"""
-    return fetch_stock_profile(code, name)
 
 
 def parse_keyword_input(value: str) -> list[str]:
@@ -1295,6 +1233,29 @@ def cached_sector_digest(
 MAX_DIGEST_SECTORS = 5
 
 
+def describe_llm_error(exc: Exception) -> str:
+    """把 LLM 调用异常翻译成能直接照着处理的说明。"""
+    if isinstance(exc, requests.Timeout):
+        return (
+            "调用超时。模型生成整段日报通常需要 10-60 秒，"
+            "可在 Secrets 里调大 LLM_COMPLETE_TIMEOUT（当前默认 90 秒）。"
+        )
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", "")
+        body = str(getattr(response, "text", ""))[:200]
+        if status == 401:
+            return f"鉴权失败（401）：API Key 无效或已过期。{body}"
+        if status == 404:
+            return f"接口不存在（404）：检查 *_ENDPOINT 与 *_MODEL 是否匹配。{body}"
+        if status == 429:
+            return f"触发限流（429）：账户额度或并发不足。{body}"
+        return f"接口返回 {status}：{body}"
+    if isinstance(exc, requests.RequestException):
+        return f"网络请求失败：{exc}"
+    return f"{type(exc).__name__}: {exc}"
+
+
 def render_daily_digest_section(
     llm_verifier: LLMVerifier | None,
     selected_sectors: list[str],
@@ -1340,7 +1301,7 @@ def render_daily_digest_section(
                         llm_verifier,
                     )
             except Exception as exc:
-                st.warning(f"「{sector}」日报生成失败：{exc}")
+                st.warning(f"「{sector}」日报生成失败：{describe_llm_error(exc)}")
                 continue
             if digest_text:
                 st.markdown(f"**{sector}**：{digest_text}")
@@ -1435,177 +1396,6 @@ def show_sector_section(
     )
 
 
-def _format_quote_change(quote: dict[str, str]) -> tuple[str, str]:
-    """返回（涨跌幅文本, tag 样式类）。A 股习惯：红涨绿跌。"""
-    raw = quote.get("涨幅", "")
-    try:
-        change = float(raw)
-    except (TypeError, ValueError):
-        return "", "tag-neu"
-    if change > 0:
-        return f"+{change:.2f}%", "tag-pos"
-    if change < 0:
-        return f"{change:.2f}%", "tag-neg"
-    return "0.00%", "tag-neu"
-
-
-def render_stock_profile_card(profile: StockProfile, related_sectors: list[str]) -> None:
-    quote_tags = ""
-    latest = str(profile.quote.get("最新", "") or "").strip()
-    if latest:
-        change_text, change_class = _format_quote_change(profile.quote)
-        quote_tags = f'<span class="pill">最新价 {escape(latest)}</span>'
-        if change_text:
-            quote_tags += f'<span class="tag {change_class}">{escape(change_text)}</span>'
-
-    metrics: list[tuple[str, str]] = [
-        ("所属行业", profile.industry or "-"),
-        ("总市值", format_market_cap(profile.info.get("总市值", ""))),
-        ("流通市值", format_market_cap(profile.info.get("流通市值", ""))),
-        ("上市时间", profile.info.get("上市时间", "-") or "-"),
-    ]
-    metric_html = "".join(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">{escape(label)}</div>
-            <div class="metric-value">{escape(str(value))}</div>
-        </div>
-        """
-        for label, value in metrics
-    )
-
-    if related_sectors:
-        sector_pills = "".join(
-            f'<span class="keyword-tag">{escape(sector)}</span>'
-            for sector in related_sectors
-        )
-        sectors_html = (
-            f'<div class="news-meta" style="margin-top:0.6rem;">关联板块：{sector_pills}</div>'
-        )
-    else:
-        sectors_html = (
-            '<div class="news-meta" style="margin-top:0.6rem;">'
-            "未能识别关联板块，下方仅展示直接提及该股票的新闻。</div>"
-        )
-
-    warning_html = ""
-    if profile.error:
-        warning_html = f'<div class="section-warning">{escape(profile.error)}</div>'
-
-    st.markdown(
-        f"""
-        <section class="sector-section">
-            <div class="sector-heading">
-                <div class="sector-name">{escape(profile.name)}（{escape(profile.code)}）</div>
-                <div class="sector-meta">{quote_tags}</div>
-            </div>
-            {warning_html}
-            <div class="metric-grid">{metric_html}</div>
-            {sectors_html}
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def show_stock_mention_news(
-    stock_name: str,
-    sector_time_df: pd.DataFrame,
-    external_time_df: pd.DataFrame,
-    selected_sources: list[str],
-    max_items: int,
-    hot_links: set[str] | None,
-) -> None:
-    frames = [df for df in (sector_time_df, external_time_df) if not df.empty]
-    combined_df = (
-        pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    )
-    mention_df = filter_news(combined_df, stock_name, selected_sources)
-    if not mention_df.empty and "原文链接" in mention_df.columns:
-        mention_df = mention_df.drop_duplicates(subset=["原文链接"]).reset_index(drop=True)
-
-    if mention_df.empty:
-        body_html = (
-            '<div class="empty-state">缓存新闻中暂未直接提及该股票，'
-            "可查看下方关联板块新闻。</div>"
-        )
-    else:
-        sorted_df = sort_news_by_importance(mention_df)
-        news_html = "".join(
-            render_news_item(sorted_df.iloc[position], hot_links)
-            for position in range(min(len(sorted_df), max_items))
-        )
-        body_html = f'<div class="news-list">{news_html}</div>'
-
-    st.markdown(
-        f"""
-        <section class="sector-section">
-            <div class="sector-heading">
-                <div class="sector-name">{escape(stock_name)}直接相关新闻</div>
-                <div class="sector-meta">
-                    <span class="pill">共 {len(mention_df)} 条</span>
-                </div>
-            </div>
-            {body_html}
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def show_stock_search_section(
-    stock_query: str,
-    sector_time_df: pd.DataFrame,
-    external_time_df: pd.DataFrame,
-    sectors_config: dict[str, Any],
-    selected_sources: list[str],
-    max_items: int,
-    hot_links: set[str] | None,
-) -> None:
-    st.markdown('<div class="section-title">股票搜索</div>', unsafe_allow_html=True)
-    matches = search_stocks(stock_query, cached_stock_list())
-    if not matches:
-        st.info(f"未找到与“{stock_query}”匹配的股票，请检查代码或名称。")
-        return
-
-    match = matches[0]
-    if len(matches) > 1:
-        match = st.selectbox(
-            "匹配到多只股票，请选择",
-            options=matches,
-            format_func=lambda item: item.label,
-        )
-
-    with st.spinner(f"正在获取 {match.name} 的信息…"):
-        profile = cached_stock_profile(match.code, match.name)
-    related_sectors = match_sectors_for_stock(
-        match.name, profile.industry, sectors_config
-    )
-
-    render_stock_profile_card(profile, related_sectors)
-    show_stock_mention_news(
-        match.name,
-        sector_time_df,
-        external_time_df,
-        selected_sources,
-        max_items,
-        hot_links,
-    )
-
-    for sector in related_sectors:
-        sector_df = sector_time_df[
-            sector_time_df["sector"] == sector
-        ].reset_index(drop=True) if "sector" in sector_time_df.columns else sector_time_df.iloc[0:0]
-        show_sector_section(
-            sector,
-            SectorResult(data=sector_df),
-            "",
-            selected_sources,
-            max_items,
-            hot_links,
-        )
-
-
 def show_external_events_section(
     external_df: pd.DataFrame,
     warnings_by_event: dict[str, list[str]],
@@ -1695,7 +1485,7 @@ def render_dashboard_header(
         f"""
         <section class="masthead">
             <div class="masthead-top">
-                <div class="masthead-title">A股板块新闻</div>
+                <div class="masthead-title">板块新闻</div>
                 <div class="masthead-date">{escape(date_text)}</div>
             </div>
             <div class="ticker-strip">{stats_html}</div>
@@ -1890,7 +1680,6 @@ def render_event_config_manager(
 
 
 FILTER_STATE_DEFAULTS: dict[str, Any] = {
-    "stock_query": "",
     "sector_query": "",
     "display_scope": "全部",
     "time_range": "全部",
@@ -2038,14 +1827,6 @@ def main() -> None:
         st.sidebar.warning(sectors_config_error)
     if events_config_error:
         st.sidebar.warning(events_config_error)
-
-    st.sidebar.markdown('<div class="side-label">个股</div>', unsafe_allow_html=True)
-    stock_query = st.sidebar.text_input(
-        "股票搜索",
-        placeholder="股票代码或名称，如 600519 / 贵州茅台",
-        key="stock_query",
-        label_visibility="collapsed",
-    )
 
     st.sidebar.markdown('<div class="side-label">关注板块</div>', unsafe_allow_html=True)
     sector_query = st.sidebar.text_input(
@@ -2228,17 +2009,6 @@ def main() -> None:
         st.info("缓存暂无新闻。后台任务会定时抓取，也可以在“数据管理与高级设置”中手动刷新。")
     elif sector_cache_display_df.empty and external_display_df.empty:
         st.info("当前时间范围下暂无新闻。可以尝试扩大时间范围或选择更多板块。")
-
-    if stock_query.strip():
-        show_stock_search_section(
-            stock_query.strip(),
-            sector_cache_display_df,
-            external_display_df,
-            sectors_config,
-            selected_sources,
-            max_items,
-            hot_links,
-        )
 
     show_hot_news_section(hot_df, hot_used_fallback)
 
