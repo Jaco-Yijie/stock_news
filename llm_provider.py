@@ -12,7 +12,11 @@ from classifier import LLMValidationResult, parse_llm_validation
 
 PROMPT_VERSION = "news-classification-reverse-v1"
 RULE_VERSION = "structured-rules-v1"
+# 分类校验只要一小段 JSON，8 秒足够；日报要生成整段中文，
+# 输入约 1500 token、输出 200+ token，8 秒必然读超时，单独放宽。
 DEFAULT_TIMEOUT = 8
+DEFAULT_COMPLETE_TIMEOUT = 90
+DIGEST_MAX_TOKENS = 600
 
 PROVIDER_DEFAULTS = {
     "doubao": {
@@ -35,6 +39,7 @@ class LLMProviderConfig:
     endpoint: str
     model: str
     timeout: int = DEFAULT_TIMEOUT
+    complete_timeout: int = DEFAULT_COMPLETE_TIMEOUT
     prompt_version: str = PROMPT_VERSION
     rule_version: str = RULE_VERSION
 
@@ -51,6 +56,7 @@ class ChatCompletionsLLMVerifier:
         self.prompt_version = config.prompt_version
         self.rule_version = config.rule_version
         self.timeout = config.timeout
+        self.complete_timeout = config.complete_timeout
         self._api_key = config.api_key
         self._post = post or requests.post
 
@@ -98,7 +104,11 @@ class ChatCompletionsLLMVerifier:
         return parse_llm_validation(content)
 
     def complete(self, system_prompt: str, user_prompt: str) -> str:
-        """通用文本生成（用于日报归纳等场景，不强制 JSON 输出）。"""
+        """通用文本生成（用于日报归纳等场景，不强制 JSON 输出）。
+
+        生成整段中文比分类校验慢一个数量级，用 complete_timeout 而不是
+        verify 的短超时；同时限制输出长度，避免模型跑长拖垮页面。
+        """
         if self.provider == "doubao" and "/responses" in self.endpoint.casefold():
             payload = {
                 "model": self.model,
@@ -106,8 +116,11 @@ class ChatCompletionsLLMVerifier:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
+                "max_output_tokens": DIGEST_MAX_TOKENS,
             }
-            return _extract_responses_content(self._post_json(payload))
+            return _extract_responses_content(
+                self._post_json(payload, timeout=self.complete_timeout)
+            )
 
         payload = {
             "model": self.model,
@@ -116,15 +129,20 @@ class ChatCompletionsLLMVerifier:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.3,
+            "max_tokens": DIGEST_MAX_TOKENS,
         }
-        data = self._post_json(payload)
+        data = self._post_json(payload, timeout=self.complete_timeout)
         return (
             data.get("choices", [{}])[0]
             .get("message", {})
             .get("content", "")
         )
 
-    def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_json(
+        self,
+        payload: dict[str, Any],
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
         response = self._post(
             self.endpoint,
             headers={
@@ -132,7 +150,7 @@ class ChatCompletionsLLMVerifier:
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=self.timeout,
+            timeout=self.timeout if timeout is None else timeout,
         )
         response.raise_for_status()
         data = response.json()
@@ -166,12 +184,14 @@ def load_llm_verifier_from_env() -> tuple[ChatCompletionsLLMVerifier | None, str
         return None, f"LLM 反向校验未启用：缺少环境变量 {model_env}。"
 
     timeout = _env_int("LLM_VERIFY_TIMEOUT", DEFAULT_TIMEOUT)
+    complete_timeout = _env_int("LLM_COMPLETE_TIMEOUT", DEFAULT_COMPLETE_TIMEOUT)
     config = LLMProviderConfig(
         provider=provider,
         api_key=api_key,
         endpoint=endpoint,
         model=model,
         timeout=timeout,
+        complete_timeout=complete_timeout,
     )
     return ChatCompletionsLLMVerifier(config), None
 

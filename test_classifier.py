@@ -986,7 +986,53 @@ def test_old_custom_sector_cache_uses_rule_id() -> None:
     assert warnings
 
 
+def test_complete_uses_longer_timeout_than_verify() -> None:
+    """日报生成走 complete_timeout；用 verify 的 8 秒短超时必然读超时。"""
+    calls: list[dict[str, Any]] = []
+
+    def fake_post(url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"timeout": kwargs["timeout"], "payload": kwargs["json"]})
+        return FakeResponse("半导体板块今日整体偏利好。")
+
+    verifier = ChatCompletionsLLMVerifier(
+        LLMProviderConfig(
+            provider="deepseek",
+            api_key="test-secret",
+            endpoint="https://example.com/chat/completions",
+            model="deepseek-chat",
+            timeout=8,
+            complete_timeout=90,
+        ),
+        post=fake_post,
+    )
+
+    verifier.complete("系统提示", "用户提示")
+
+    assert calls[0]["timeout"] == 90
+    assert calls[0]["payload"]["max_tokens"] == 600
+
+
+def test_complete_timeout_reads_env_override() -> None:
+    with temporary_env(
+        {
+            "LLM_VERIFY_PROVIDER": "deepseek",
+            "DEEPSEEK_API_KEY": "test-secret",
+            "DEEPSEEK_ENDPOINT": "https://example.com/chat/completions",
+            "DEEPSEEK_MODEL": "deepseek-chat",
+            "LLM_COMPLETE_TIMEOUT": "120",
+        }
+    ):
+        verifier, notice = load_llm_verifier_from_env()
+
+    assert notice is None
+    assert verifier is not None
+    assert verifier.complete_timeout == 120
+    assert verifier.timeout == 8
+
+
 if __name__ == "__main__":
+    test_complete_uses_longer_timeout_than_verify()
+    test_complete_timeout_reads_env_override()
     test_sector_config_compatibility()
     test_sector_keyword_update_preserves_rule_id()
     test_unknown_rule_id_does_not_fallback_to_sector_name()
