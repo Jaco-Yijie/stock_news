@@ -1,0 +1,65 @@
+name: Agent compare
+
+on:
+  schedule:
+    # UTC 00:10 = 北京时间 08:10，与 daily-report 同一天的数据做并行对比
+    - cron: "10 0 * * *"
+  workflow_dispatch:
+    inputs:
+      sectors:
+        description: "板块名（空格分隔，留空跑全部）"
+        required: false
+        default: ""
+
+concurrency:
+  group: agent-compare
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # 不配置 Supabase：两侧都在空缓存上跑全量抓取结果，保证对比口径一致，
+      # 也避免与 daily-report 的缓存写入互相干扰。LLM 仅 Agent 侧决策使用。
+      LLM_VERIFY_PROVIDER: ${{ secrets.LLM_VERIFY_PROVIDER }}
+      DOUBAO_API_KEY: ${{ secrets.DOUBAO_API_KEY }}
+      DOUBAO_ENDPOINT: ${{ secrets.DOUBAO_ENDPOINT }}
+      DOUBAO_MODEL: ${{ secrets.DOUBAO_MODEL }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      DEEPSEEK_ENDPOINT: ${{ secrets.DEEPSEEK_ENDPOINT }}
+      DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run agent pipeline (dry-run, no push)
+        run: |
+          SECTORS="${{ github.event.inputs.sectors }}"
+          if [ -n "$SECTORS" ]; then
+            python -m agent.run_agent --sectors $SECTORS --dry-run
+          else
+            python -m agent.run_agent --all --dry-run
+          fi
+
+      - name: Build compare report
+        run: python -m agent.compare_report --trace agent_trace.jsonl
+
+      - name: Append compare summary to job summary
+        run: cat compare_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-compare-${{ github.run_id }}
+          path: |
+            agent_trace.jsonl
+            compare_report.md
+            compare_report.json
+          retention-days: 30
