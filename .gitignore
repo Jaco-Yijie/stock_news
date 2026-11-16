@@ -6,3 +6,6 @@ data/news_cache.csv
 .agents/
 .claude/
 skills-lock.json
+agent_trace.jsonl
+compare_report.md
+compare_report.json
