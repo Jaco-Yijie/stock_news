@@ -5,6 +5,9 @@
 """
 from __future__ import annotations
 
+import re
+import unicodedata
+from collections.abc import Iterable
 from typing import Any
 
 import pandas as pd
@@ -27,35 +30,94 @@ from time_utils import now_utc8_naive
 SENTIMENT_LABELS = {"positive": "利好", "neutral": "中性", "negative": "利空"}
 IMPACT_LABELS = {"high": "高影响", "medium": "中影响", "low": "低影响"}
 IMPACT_SCORES = {"high": 3.0, "medium": 2.0, "low": 1.0}
-GENERIC_DIRECTION_THRESHOLD = 1.0
+GENERIC_DIRECTION_THRESHOLD = 1.8
 LOW_CONFIDENCE_THRESHOLD = 45
 HOT_NEWS_LIMIT = 5
 HOT_NEWS_MIN_TODAY = 3
 LOW_CONFIDENCE_REASON = "判断依据不足"
+MIXED_REASON = "正负方向信号并存，整体按中性处理"
+UNCONFIRMED_REASON = "涉及否认、传闻或条件判断，缺少已确认的方向信号"
+
+_COMPARISON_MODIFIERS = re.compile(
+    r"(?P<metric>净利润|净利|营收|营业收入|订单|需求|销量|出货量|毛利率|经营现金流|资本开支)"
+    r"(?:\s*(?:同比|环比|较上年同期|较去年同期|大幅|小幅|显著|明显|继续)){1,3}\s*"
+)
+_CLAUSE_BOUNDARY = re.compile(r"[,，。;；!?！？、\n]+|但是|然而|不过|但")
+_UNCONFIRMED = re.compile(
+    r"否认|辟谣|传闻|网传|谣传|不实|未经证实|尚未|暂未|并未|并无|没有|未曾|不排除|"
+    r"若(?!干)|假如|如果|是否|或将|可能|有望|不会|中标候选人|拟中标|"
+    r"未获批|未能(?:获批|通过审批|解除|取得)|"
+    r"(?:拟|计划|无意|无)(?:将|实施|进一步)?(?:加息|降息|停产|裁员|扩产|取消|加征|收紧|下调|撤销)"
+)
 
 
-def _match_signals(text: str, signals: dict[str, float]) -> tuple[float, list[str]]:
-    score = 0.0
-    hits: list[str] = []
-    for keyword, weight in signals.items():
-        if keyword.casefold() in text:
-            score += weight
-            hits.append(keyword)
-    return score, hits
+def _alternatives(keywords: Iterable[str]) -> re.Pattern[str]:
+    ordered = sorted((word.casefold() for word in keywords), key=len, reverse=True)
+    return re.compile("|".join(re.escape(word) for word in ordered))
 
 
-def _match_macro_rules(text: str) -> tuple[dict[str, tuple[str, str]], list[str]]:
-    assessments: dict[str, tuple[str, str]] = {}
-    hit_rules: list[str] = []
-    for rule in MACRO_RULES:
-        if not any(keyword.casefold() in text for keyword in rule["keywords"]):
+_DIRECTION_TERMS = _alternatives(POSITIVE_SIGNALS.keys() | NEGATIVE_SIGNALS.keys())
+_MACRO_PATTERNS = [
+    (rule, _alternatives(rule["keywords"]), _alternatives(rule["co_keywords"]),
+     _alternatives(rule["exclude"]) if rule.get("exclude") else None)
+    for rule in MACRO_RULES
+]
+
+
+def _evidence_clauses(text: str) -> tuple[list[str], bool]:
+    clauses = []
+    blocked = False
+    for clause in _CLAUSE_BOUNDARY.split(text):
+        clause = clause.strip()
+        if not clause:
             continue
-        co_keywords = rule.get("co_keywords") or []
-        if co_keywords and not any(keyword.casefold() in text for keyword in co_keywords):
+        if _UNCONFIRMED.search(clause):
+            blocked = True
+            continue
+        clauses.append(_COMPARISON_MODIFIERS.sub(r"\g<metric>", clause))
+    return clauses, blocked
+
+
+def _generic_evidence(clauses: list[str]) -> tuple[str, str, float, float]:
+    terms = dict.fromkeys(match.group() for text in clauses for match in _DIRECTION_TERMS.finditer(text))
+    positive = [term for term in terms if term in POSITIVE_SIGNALS]
+    negative = [term for term in terms if term in NEGATIVE_SIGNALS]
+    pos_score = sum(POSITIVE_SIGNALS[term] for term in positive)
+    neg_score = sum(NEGATIVE_SIGNALS[term] for term in negative)
+    strength = max(pos_score, neg_score)
+    balance = pos_score - neg_score
+    if pos_score >= GENERIC_DIRECTION_THRESHOLD and neg_score >= GENERIC_DIRECTION_THRESHOLD:
+        return "neutral", MIXED_REASON, strength, balance
+    if balance >= GENERIC_DIRECTION_THRESHOLD:
+        return "positive", "命中利好信号：" + "、".join(positive[:4]), strength, balance
+    if balance <= -GENERIC_DIRECTION_THRESHOLD:
+        return "negative", "命中利空信号：" + "、".join(negative[:4]), strength, balance
+    reason = MIXED_REASON if positive and negative else LOW_CONFIDENCE_REASON
+    return "neutral", reason, strength, balance
+
+
+def _match_macro_rules(clauses: list[str]) -> tuple[dict[str, tuple[str, str]], list[str]]:
+    evidence: dict[str, dict[str, str]] = {}
+    hit_rules: list[str] = []
+    for rule, subjects, directions, excluded in _MACRO_PATTERNS:
+        if not any(subjects.search(text) and directions.search(text) and (
+            excluded is None or not excluded.search(text)
+        ) for text in clauses):
             continue
         hit_rules.append(rule["name"])
-        for sector, assessment in rule["sector_sentiments"].items():
-            assessments.setdefault(sector, assessment)
+        for sector, (direction, reason) in rule["sector_sentiments"].items():
+            evidence.setdefault(sector, {}).setdefault(direction, reason)
+
+    assessments = {}
+    for sector, directions in evidence.items():
+        if "positive" in directions and "negative" in directions:
+            assessments[sector] = ("neutral", MIXED_REASON)
+        elif "positive" in directions:
+            assessments[sector] = ("positive", directions["positive"])
+        elif "negative" in directions:
+            assessments[sector] = ("negative", directions["negative"])
+        else:
+            assessments[sector] = ("neutral", directions["neutral"])
     return assessments, hit_rules
 
 
@@ -87,24 +149,21 @@ def _impact_level(text: str, macro_hit: bool, direction_strength: float) -> str:
 
 def analyze_news_item(news: dict[str, Any], target_sectors: list[str]) -> dict[str, Any]:
     """按规则判断一条新闻的方向、影响与板块级评估。"""
-    title = str(news.get("标题", "") or "")
-    content = str(news.get("新闻内容", "") or "")
-    text = f"{title} {content}".casefold()
+    title = unicodedata.normalize("NFKC", str(news.get("标题") or "")).strip().casefold()
+    content = unicodedata.normalize("NFKC", str(news.get("新闻内容") or "")).casefold()
+    text = f"{title} {content}"
+    clauses, blocked = ([], True) if title.endswith("?") else _evidence_clauses(title)
+    macro_assessments, macro_hits = _match_macro_rules(clauses)
+    generic_sentiment, generic_reason, strength, balance = _generic_evidence(clauses)
 
-    positive_score, positive_hits = _match_signals(text, POSITIVE_SIGNALS)
-    negative_score, negative_hits = _match_signals(text, NEGATIVE_SIGNALS)
-    macro_assessments, macro_hits = _match_macro_rules(text)
-
-    direction_score = positive_score - negative_score
-    if direction_score >= GENERIC_DIRECTION_THRESHOLD:
-        generic_sentiment = "positive"
-        generic_reason = "命中利好信号：" + "、".join(positive_hits[:4])
-    elif direction_score <= -GENERIC_DIRECTION_THRESHOLD:
-        generic_sentiment = "negative"
-        generic_reason = "命中利空信号：" + "、".join(negative_hits[:4])
-    else:
-        generic_sentiment = "neutral"
-        generic_reason = LOW_CONFIDENCE_REASON
+    # 明确的标题事件优先，正文仅在标题没有给出清晰方向时补充。
+    if not macro_hits and strength < GENERIC_DIRECTION_THRESHOLD and not blocked:
+        body_clauses, blocked = _evidence_clauses(content)
+        clauses.extend(body_clauses)
+        macro_assessments, macro_hits = _match_macro_rules(clauses)
+        generic_sentiment, generic_reason, strength, balance = _generic_evidence(clauses)
+    if blocked and generic_reason == LOW_CONFIDENCE_REASON:
+        generic_reason = UNCONFIRMED_REASON
 
     sector_assessments: dict[str, dict[str, str]] = {}
     for sector in target_sectors:
@@ -113,6 +172,8 @@ def analyze_news_item(news: dict[str, Any], target_sectors: list[str]) -> dict[s
             continue
         if sector in macro_assessments:
             sentiment, reason = macro_assessments[sector]
+        elif macro_assessments:
+            sentiment, reason = "neutral", f"该事件对{sector}的影响方向不明确"
         else:
             sentiment, reason = generic_sentiment, generic_reason
         sector_assessments[sector] = {"sentiment": sentiment, "reason": reason}
@@ -138,20 +199,16 @@ def analyze_news_item(news: dict[str, Any], target_sectors: list[str]) -> dict[s
         )
     elif sector_assessments:
         overall_sentiment = "neutral"
-        overall_reason = next(iter(sector_assessments.values()))["reason"]
+        overall_reason = next(
+            (item["reason"] for item in sector_assessments.values() if item["reason"] == MIXED_REASON),
+            next(iter(sector_assessments.values()))["reason"],
+        )
     else:
         overall_sentiment = generic_sentiment
         overall_reason = generic_reason
 
-    signal_count = len(positive_hits) + len(negative_hits) + 2 * len(macro_hits)
-    confidence = min(90, 20 + 20 * signal_count)
-
-    # 依据不足时不强行给方向，统一按中性处理
-    if overall_sentiment != "neutral" and confidence < LOW_CONFIDENCE_THRESHOLD:
-        overall_sentiment = "neutral"
-        overall_reason = LOW_CONFIDENCE_REASON
-
-    direction_strength = max(abs(direction_score), 2.0 if macro_hits else 0.0)
+    confidence = min(90, 20 + int(strength * 16) + min(36, 30 * len(macro_hits)))
+    direction_strength = max(abs(balance), strength, 2.0 if macro_hits else 0.0)
     impact_level = _impact_level(text, bool(macro_hits), direction_strength)
     category = _news_category(text)
     importance = (

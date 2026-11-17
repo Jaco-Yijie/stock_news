@@ -1,28 +1,18 @@
 """新旧管线对比报告：python -m agent.compare_report --trace agent_trace.jsonl [--date 2026-11-16]
 
-对同一天、同一批板块：
-- Agent 侧：读取 run_agent 落盘的 trace（kept_items 来自决策结果）；
-- 规则侧：重新抓取同板块新闻，走纯规则分类（use_llm=False），得到规则保留集；
-- 输出交集/差集统计与 LLM 调用量，写 Markdown + JSON，供并行期每天对比。
+读取 --compare 生成的同批候选 trace，比较两侧排序截断前的分类结果。
 """
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
-import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from agent.bad_case import BAD_CASES_PATH, from_compare_report, item_key
 from sectors import SECTORS
-from tools.classify import classify_news
-from tools.dedupe import filter_new_news
-from tools.fetch import fetch_sector_news
-from tools.schemas import (
-    ClassifyNewsInput,
-    FetchSectorNewsInput,
-    FilterNewNewsInput,
-)
+from time_utils import now_utc8_naive
 
 
 @dataclass
@@ -35,6 +25,8 @@ class SectorCompare:
     rules_only: list[str] = field(default_factory=list)
     agent_fallback: bool = False
     tool_calls: int = 0
+    llm_calls: int | None = None
+    unavailable: str = ""
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -46,12 +38,17 @@ class SectorCompare:
             "rules_only": len(self.rules_only),
             "agent_fallback": self.agent_fallback,
             "tool_calls": self.tool_calls,
+            "llm_calls": self.llm_calls,
+            "comparable": not self.unavailable,
+            "unavailable": self.unavailable,
+            "agent_only_items": _items_for_keys(self.agent_kept, self.agent_only),
+            "rules_only_items": _items_for_keys(self.rules_kept, self.rules_only),
         }
 
 
-def _key(item: dict[str, str]) -> str:
-    """对比键：优先链接，无链接退回标题。"""
-    return str(item.get("link") or item.get("title") or "")
+def _items_for_keys(items: list[dict[str, str]], keys: list[str]) -> list[dict[str, str]]:
+    by_key = {item_key(item): item for item in items}
+    return [by_key[key] for key in keys]
 
 
 def diff_kept(
@@ -59,11 +56,11 @@ def diff_kept(
     rules_items: list[dict[str, str]],
 ) -> tuple[list[str], list[str], list[str]]:
     """返回 (交集, 仅 Agent 保留, 仅规则保留)，按对比键去重。纯函数，便于单测。"""
-    agent_map = {_key(i): i for i in agent_items if _key(i)}
-    rules_map = {_key(i): i for i in rules_items if _key(i)}
-    both = sorted(set(agent_map) & set(rules_map))
-    agent_only = sorted(set(agent_map) - set(rules_map))
-    rules_only = sorted(set(rules_map) - set(agent_map))
+    agent_keys = set(map(item_key, agent_items)) - {""}
+    rules_keys = set(map(item_key, rules_items)) - {""}
+    both = sorted(agent_keys & rules_keys)
+    agent_only = sorted(agent_keys - rules_keys)
+    rules_only = sorted(rules_keys - agent_keys)
     return both, agent_only, rules_only
 
 
@@ -82,42 +79,23 @@ def load_agent_trace(trace_path: str, date: str) -> dict[str, dict[str, Any]]:
     return records
 
 
-def rules_side_kept(sector: str) -> tuple[list[dict[str, str]], str | None]:
-    """规则管线基线：抓取 → 增量过滤 → 纯规则分类，返回 (kept 列表, 错误信息)。"""
-    fetched = fetch_sector_news(FetchSectorNewsInput(sector=sector))
-    if fetched.get("error"):
-        return [], fetched["error"]
-    fresh = filter_new_news(FilterNewNewsInput(items=fetched.get("items", [])))
-    kept: list[dict[str, str]] = []
-    for item in fresh.get("items", []):
-        result = classify_news(ClassifyNewsInput(
-            sector=sector,
-            title=str(item.get("标题", "")),
-            content=str(item.get("新闻内容", "")),
-            use_llm=False,
-        ))
-        if result.get("matched"):
-            kept.append({
-                "title": str(item.get("标题", "")),
-                "link": str(item.get("原文链接", "")),
-            })
-    return kept, None
-
-
 def compare(date: str, trace_path: str, sectors: list[str]) -> list[SectorCompare]:
     trace = load_agent_trace(trace_path, date)
     results: list[SectorCompare] = []
     for sector in sectors:
         row = SectorCompare(sector=sector)
         record = trace.get(sector, {})
-        row.agent_kept = list(record.get("kept_items", []))
+        row.agent_kept = record.get("agent_selected", record.get("kept_items", []))
         row.agent_fallback = bool(record.get("agent_fallback", False))
         row.tool_calls = len(record.get("tool_calls", []))
-        rules_kept, error = rules_side_kept(sector)
-        if error:
-            print(f"[warn] 规则侧「{sector}」抓取失败：{error}", file=sys.stderr)
-        row.rules_kept = rules_kept
-        row.both, row.agent_only, row.rules_only = diff_kept(row.agent_kept, row.rules_kept)
+        row.llm_calls = record.get("llm_calls")
+        if "candidate_items" not in record:
+            row.unavailable = record.get("snapshot_error", "缺少同批候选快照")
+        elif record.get("rules_selected") is None:
+            row.unavailable = "规则侧分类失败"
+        else:
+            row.rules_kept = record["rules_selected"]
+            row.both, row.agent_only, row.rules_only = diff_kept(row.agent_kept, row.rules_kept)
         results.append(row)
     return results
 
@@ -126,19 +104,25 @@ def render_markdown(date: str, rows: list[SectorCompare]) -> str:
     lines = [
         f"# 新旧管线对比（{date}）",
         "",
-        "| 板块 | Agent 保留 | 规则保留 | 交集 | 仅 Agent | 仅规则 | 兜底 | LLM 调用 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | :-: | ---: |",
+        "两侧使用同一批候选，比较分类与复核后的去留，统计点在排序取前 10 条之前。",
+        "",
+        "| 板块 | Agent 保留 | 规则保留 | 交集 | 仅 Agent | 仅规则 | 兜底 | 工具调用 | 决策模型调用 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | :-: | ---: | ---: |",
     ]
-    total_calls = 0
     for row in rows:
         s = row.summary()
-        total_calls += s["tool_calls"]
+        if row.unavailable:
+            lines.append(f"| {row.sector}（{row.unavailable}） | — | — | — | — | — | — | — | — |")
+            continue
+        llm_calls = row.llm_calls if row.llm_calls is not None else "—"
         lines.append(
             f"| {s['sector']} | {s['agent_kept']} | {s['rules_kept']} | {s['overlap']} "
             f"| {s['agent_only']} | {s['rules_only']} "
-            f"| {'是' if s['agent_fallback'] else '否'} | {s['tool_calls']} |"
+            f"| {'是' if s['agent_fallback'] else '否'} | {s['tool_calls']} | {llm_calls} |"
         )
-    lines += ["", f"LLM 调用合计：{total_calls} 次", ""]
+    measured = [row.llm_calls for row in rows if row.llm_calls is not None]
+    total = f"{sum(measured)} 次" if measured else "无记录"
+    lines += ["", f"决策模型调用合计：{total}（含 Planner、ReAct、Critic 的调用尝试）。", ""]
     for row in rows:
         if not row.agent_only and not row.rules_only:
             continue
@@ -156,10 +140,12 @@ def render_markdown(date: str, rows: list[SectorCompare]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Agent 管线 vs 规则管线对比报告")
     parser.add_argument("--trace", default="agent_trace.jsonl", help="run_agent 落盘的 trace 文件")
-    parser.add_argument("--date", default=dt.date.today().isoformat())
+    parser.add_argument("--date", default=now_utc8_naive().date().isoformat())
     parser.add_argument("--sectors", nargs="+", default=None, help="默认取 trace 中当日出现的板块")
     parser.add_argument("--out-md", default="compare_report.md")
     parser.add_argument("--out-json", default="compare_report.json")
+    parser.add_argument("--bad-cases", type=Path, default=BAD_CASES_PATH,
+                        help="待审核差异与人工标签的 JSONL 文件")
     args = parser.parse_args()
 
     trace = load_agent_trace(args.trace, args.date)
@@ -179,6 +165,8 @@ def main() -> int:
             fh, ensure_ascii=False, indent=2,
         )
     print(md)
+    added = from_compare_report(args.out_json, args.bad_cases)
+    print(f"新增待审核案例：{added} 条")
     return 0
 
 

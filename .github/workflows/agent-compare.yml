@@ -20,8 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # 不配置 Supabase：两侧都在空缓存上跑全量抓取结果，保证对比口径一致，
-      # 也避免与 daily-report 的缓存写入互相干扰。LLM 仅 Agent 侧决策使用。
+      # 空缓存下只抓一次，两侧共用候选，不影响 daily-report 的 Supabase 缓存。
       LLM_VERIFY_PROVIDER: ${{ secrets.LLM_VERIFY_PROVIDER }}
       DOUBAO_API_KEY: ${{ secrets.DOUBAO_API_KEY }}
       DOUBAO_ENDPOINT: ${{ secrets.DOUBAO_ENDPOINT }}
@@ -40,17 +39,31 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run agent pipeline (dry-run, no push)
+      - name: Export Telegram feedback for Critic
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
-          SECTORS="${{ github.event.inputs.sectors }}"
-          if [ -n "$SECTORS" ]; then
-            python -m agent.run_agent --sectors $SECTORS --dry-run
-          else
-            python -m agent.run_agent --all --dry-run
+          if [[ -n "$SUPABASE_URL" && -n "$SUPABASE_KEY" ]]; then
+            python feedback_bot.py --export --require-supabase || echo "::warning::Telegram 反馈导出失败，本次对比继续"
           fi
 
+      - name: Run agent pipeline (dry-run, no push)
+        shell: bash
+        env:
+          COMPARE_SECTORS: ${{ inputs.sectors }}
+        run: |
+          report_date="$(TZ=Asia/Shanghai date +%F)"
+          echo "COMPARE_DATE=$report_date" >> "$GITHUB_ENV"
+          args=(--all)
+          if [[ -n "${COMPARE_SECTORS//[[:space:]]/}" ]]; then
+            read -r -a sectors <<< "$COMPARE_SECTORS"
+            args=(--sectors "${sectors[@]}")
+          fi
+          python -m agent.run_agent "${args[@]}" --dry-run --compare --date "$report_date"
+
       - name: Build compare report
-        run: python -m agent.compare_report --trace agent_trace.jsonl
+        run: python -m agent.compare_report --trace agent_trace.jsonl --date "$COMPARE_DATE"
 
       - name: Append compare summary to job summary
         run: cat compare_report.md >> "$GITHUB_STEP_SUMMARY"
@@ -62,4 +75,5 @@ jobs:
             agent_trace.jsonl
             compare_report.md
             compare_report.json
+            data/bad_cases.jsonl
           retention-days: 30

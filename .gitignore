@@ -2,6 +2,9 @@
 __pycache__/
 .DS_Store
 data/news_cache.csv
+data/bad_cases.jsonl
+data/telegram_feedback.sqlite3*
+data/telegram_feedback_cases.jsonl
 .env
 .agents/
 .claude/

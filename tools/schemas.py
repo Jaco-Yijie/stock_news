@@ -78,8 +78,16 @@ class ComposeDigestInput(BaseModel):
     )
 
 
+class PushFeedbackItem(BaseModel):
+    date: str
+    sector: str
+    title: str
+    link: str
+
+
 class PushTelegramInput(BaseModel):
     """把内容推送到 Telegram（需要环境变量 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID）。"""
 
     title: str = Field(description="推送标题，会加粗显示")
     content: str = Field(description="推送正文，支持 Telegram HTML 子集；超长自动分段")
+    feedback_items: list[PushFeedbackItem] = Field(default_factory=list)

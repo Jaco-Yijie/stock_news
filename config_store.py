@@ -47,8 +47,11 @@ def _save_remote_config(config_key: str, payload: Any) -> None:
 
 
 def _migrate_remote_config(config_key: str, payload: Any) -> None:
+    store = _get_config_store()
+    if store is None:
+        return
     try:
-        _save_remote_config(config_key, payload)
+        store.set_value(config_key, json.dumps(payload, ensure_ascii=False), overwrite=False)
     except Exception:
         pass
 

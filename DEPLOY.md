@@ -23,6 +23,16 @@ Streamlit Community Cloud 会根据 `requirements.txt` 安装依赖，并自动�
 6. 不填写 Start Command。
 7. 部署完成后访问 Cloud 生成的应用地址。
 
+公开看板支持浏览、筛选和重新读取缓存。需要从页面修改关键词、手动抓取、
+清空缓存或生成 LLM 日报时，在 Streamlit 的 Secrets 中配置一段独立随机口令：
+
+```toml
+DASHBOARD_ADMIN_PASSWORD = "<管理员口令>"
+```
+
+也可在本地通过同名环境变量配置。打开「数据管理与高级设置」登录即可。
+后台定时任务通过自己的 GitHub Actions Secrets 访问 Supabase，缺少配置时运行会失败并提示原因。
+
 ## 数据目录和持久化
 
 应用默认使用项目目录下的 `./data` 保存缓存和配置：
@@ -176,6 +186,13 @@ python refresh_job.py --mode incremental --retention-days 60
 配好后可以在 Actions 页面手动触发一次 `Daily report`（workflow_dispatch）验证，日志会打印推送结果。
 
 消息用 Telegram 的 HTML 模式渲染，超过 4096 字符会自动分段发送。
+
+#### Telegram 人工反馈
+
+1. 复用 `TELEGRAM_BOT_TOKEN`、数字格式的 `TELEGRAM_CHAT_ID` 和 `SUPABASE_URL`、`SUPABASE_KEY`。反馈复用已有的 `app_config` 表。
+2. 工作流进入默认分支后，`Telegram feedback` 每 30 分钟轮询，也可手动运行。首选私聊或可信群组，配置的聊天里任何成员都能标注，最后一次选择生效。
+3. 同一个 bot 只运行一个轮询入口，且需要处于无 webhook 的状态。定时轮询处理时即时弹窗可能已经超时，机器人会尝试在按钮上显示「✓」。Telegram 待处理更新最多保留 24 小时。
+4. 本地可运行 `python feedback_bot.py` 持续轮询，或用 `--once` 扫描当前队列。无 Supabase 配置时，推送端和轮询端使用同一个 `DATA_DIR` 下的 SQLite 文件。
 
 ### 注意事项
 

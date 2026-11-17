@@ -215,20 +215,22 @@ def test_push_history_roundtrip_and_dedup(tmp_path: Path = None) -> None:
     assert list(fresh["原文链接"]) == ["http://e.com/b"]
 
 
-def test_load_notifiers_cleans_pasted_secrets() -> None:
-    import os
+def test_load_notifiers_cleans_pasted_secrets(monkeypatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", " 12345:AAH\nabc ")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", " 987 654 ")
+    calls = []
 
-    os.environ["TELEGRAM_BOT_TOKEN"] = " 12345:AAH\nabc "
-    os.environ["TELEGRAM_CHAT_ID"] = " 987 654 "
-    try:
-        notifiers = notify.load_notifiers_from_env()
-    finally:
-        os.environ.pop("TELEGRAM_BOT_TOKEN", None)
-        os.environ.pop("TELEGRAM_CHAT_ID", None)
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs["json"]))
+        return FakeResponse({"ok": True})
+
+    monkeypatch.setattr(notify.requests, "post", fake_post)
+    notifiers = notify.load_notifiers_from_env()
     telegram = [n for n in notifiers if n.name == "Telegram"]
     assert telegram, "应识别出 Telegram 通道"
-    assert telegram[0]._url == "https://api.telegram.org/bot12345:AAHabc/sendMessage"
-    assert telegram[0]._chat_id == "987654"
+    telegram[0].send("标题", "内容")
+    assert calls[0][0] == "https://api.telegram.org/bot12345:AAHabc/sendMessage"
+    assert calls[0][1]["chat_id"] == "987654"
 
 
 def test_telegram_requires_both_token_and_chat_id() -> None:
@@ -257,6 +259,23 @@ def test_http_error_includes_response_body() -> None:
         notify.requests.post = original_post
     assert len(errors) == 1
     assert "403" in errors[0] and "initiate conversation" in errors[0]
+
+
+def test_telegram_network_error_does_not_expose_token(monkeypatch) -> None:
+    token = "123:example-fake-value"
+
+    def fail(url, **kwargs):
+        raise notify.requests.ConnectionError(url)
+
+    monkeypatch.setattr(notify.requests, "post", fail)
+    errors = send_to_all([TelegramNotifier(token, "chat")], "标题", _one_row_df())
+    assert len(errors) == 1 and "ConnectionError" in errors[0] and token not in errors[0]
+
+
+def test_push_formats_omit_unsafe_external_link() -> None:
+    df = pd.DataFrame([_display_row("新闻", "2026-07-05 09:00:00", "javascript:alert(1)")])
+    assert "href=" not in format_push_html(df)
+    assert "[原文]" not in format_push_markdown(df)
 
 
 def test_format_push_markdown_contains_labels() -> None:

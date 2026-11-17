@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import pytest
+from streamlit.testing.v1 import AppTest
+
+import config_store
+import llm_provider
+import news_store
+from news_links import safe_news_url
+from paths import BASE_DIR
+
+
+@pytest.mark.parametrize("url", [
+    "javascript:alert(1)", "data:text/html,x", "file:///etc/hosts",
+    "//example.com", "https://user:pass@example.com", "https://example.com/\nx",
+    'https://example.com/"x', "https://", "https://example.com:invalid",
+])
+def test_rejects_unsafe_news_urls(url):
+    assert safe_news_url(url) == ""
+
+
+def test_accepts_https_links_with_normal_query_values():
+    url = "https://example.com/news?a=1&b=%E6%96%B0%E9%97%BB"
+    assert safe_news_url(url) == url
+
+
+def test_dashboard_writes_require_admin_and_logout_revokes_access(monkeypatch):
+    monkeypatch.setattr(config_store, "_get_config_store", lambda: None)
+    monkeypatch.setattr(news_store, "get_supabase_store", lambda: None)
+    monkeypatch.setattr(llm_provider, "load_llm_verifier_from_env", lambda: (object(), None))
+    monkeypatch.delenv("DASHBOARD_ADMIN_PASSWORD", raising=False)
+    app_path = BASE_DIR / "main.py"
+    disabled = AppTest.from_file(app_path).run()
+    assert not disabled.exception
+    assert not any(button.label == "清空缓存" for button in disabled.button)
+
+    app = AppTest.from_file(app_path)
+    app.secrets["DASHBOARD_ADMIN_PASSWORD"] = "synthetic-test-only"
+    app.run()
+
+    def by_label(elements, label):
+        return next(element for element in elements if element.label == label)
+
+    def labels():
+        return {button.label for button in app.button}
+
+    assert "重新加载缓存" in labels()
+    assert not ({"清空缓存", "全量刷新", "生成 / 更新今日日报"} & labels())
+    by_label(app.text_input, "管理员口令").set_value("wrong")
+    by_label(app.button, "登录").click().run()
+    assert "清空缓存" not in labels()
+    assert any("口令不正确" in item.value for item in app.error)
+
+    by_label(app.text_input, "管理员口令").set_value("synthetic-test-only")
+    by_label(app.button, "登录").click().run()
+    assert not app.exception
+    assert {"退出管理模式", "清空缓存", "生成 / 更新今日日报"} <= labels()
+
+    by_label(app.button, "退出管理模式").click().run()
+    assert "清空缓存" not in labels()

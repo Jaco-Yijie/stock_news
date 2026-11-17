@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from analysis import (
     analyze_display_frame,
@@ -51,6 +52,59 @@ def test_low_confidence_defaults_to_neutral() -> None:
     result = analyze_news_item(news, ["银行"])
     assert result["sentiment"] == "neutral"
     assert result["reason"] == "判断依据不足"
+
+
+@pytest.mark.parametrize(("title", "sector", "expected"), [
+    ("算力需求同比下降，云厂商削减资本开支", "算力数据中心", "negative"),
+    ("云厂商上调资本开支，算力订单增长", "半导体芯片", "positive"),
+    ("iPhone 订单下滑，Apple 被迫砍单", "消费电子", "negative"),
+    ("欧盟宣布取消对家电加征关税", "家电", "positive"),
+    ("美国宣布加征家电进口关税", "家电", "negative"),
+    ("欧盟讨论家电关税安排", "家电", "neutral"),
+    ("美国宣布放宽芯片出口限制", "半导体芯片", "positive"),
+    ("传闻称美国将收紧芯片出口管制", "半导体芯片", "neutral"),
+    ("美联储维持利率不变，否认即将加息", "黄金", "neutral"),
+    ("美联储降息？", "黄金", "neutral"),
+    ("中国央行宣布降准", "证券", "positive"),
+    ("中国央行宣布降准", "银行", "neutral"),
+    ("欧洲央行宣布降息", "房地产", "neutral"),
+    ("公司净利润同比下降30%", "机器人", "negative"),
+    ("公司经营现金流转正", "机器人", "positive"),
+    ("行业龙头债券违约", "银行", "negative"),
+    ("机构公布设备项目中标候选人名单", "机器人", "neutral"),
+    ("公司中标轨道交通设备项目", "机器人", "positive"),
+    ("创新药三期临床达到主要终点", "创新药", "positive"),
+    ("创新药三期临床未能达到主要终点", "创新药", "negative"),
+    ("公司否认已获批并购传闻", "证券", "neutral"),
+    ("行业价格下跌", "有色金属", "neutral"),
+    ("纯盘面：芯片板块拉升，多股涨停", "半导体芯片", "neutral"),
+    ("公司中标后公告取消订单", "机器人", "neutral"),
+    ("公司净利润增长，但经营现金流转负", "机器人", "neutral"),
+    ("国际油价大涨后又下跌", "石油石化", "neutral"),
+])
+def test_direction_uses_event_context(title: str, sector: str, expected: str) -> None:
+    result = analyze_news_item({"标题": title}, [sector])
+    assert result["sentiment"] == result["sector_assessments"][sector]["sentiment"] == expected
+
+
+def test_commodity_prices_split_upstream_and_downstream() -> None:
+    result = analyze_news_item({"标题": "碳酸锂价格大涨"}, ["有色金属", "新能源汽车", "储能"])
+    assert result["sentiment"] == "neutral" and result["divergent"]
+    assert [value["sentiment"] for value in result["sector_assessments"].values()] == [
+        "positive", "negative", "negative",
+    ]
+
+
+def test_title_direction_takes_priority_over_background_and_rumours() -> None:
+    body = "公司净利润同比增长30%。"
+    assert analyze_news_item({"标题": "公司净利润下滑", "新闻内容": body}, [])["sentiment"] == "negative"
+    assert analyze_news_item({"标题": "公司公告业绩", "新闻内容": body}, [])["sentiment"] == "positive"
+    assert analyze_news_item({"标题": "公司否认净利润增长传闻", "新闻内容": body}, [])["sentiment"] == "neutral"
+
+
+def test_macro_subject_and_direction_must_share_a_clause() -> None:
+    result = analyze_news_item({"标题": "油价持稳，海外零售额上涨"}, ["石油石化"])
+    assert result["sentiment"] == "neutral" and not result["macro_rules"]
 
 
 def _display_row(

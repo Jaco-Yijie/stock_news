@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 import notify
+from feedback_store import FeedbackItem
 
 from .schemas import PushTelegramInput
 
@@ -21,7 +22,15 @@ def push_telegram(input: PushTelegramInput) -> dict[str, Any]:
                 "error": "未配置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID"}
 
     try:
-        notifiers[0].send(input.title, input.content)
+        items = []
+        for row in input.feedback_items:
+            item = FeedbackItem.from_news(row.date, row.sector, row.title, row.link)
+            if item is not None:
+                items.append(item)
+        if items:
+            notifiers[0].send_digest(input.title, input.content, items)
+        else:
+            notifiers[0].send(input.title, input.content)
     except Exception as exc:  # noqa: BLE001 - 工具边界：异常转为返回值
         return {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
     return {"sent": True, "error": None}

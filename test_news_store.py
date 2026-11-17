@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-from news_store import filter_incremental_news
+import refresh
+from news_store import deduplicate_cache, filter_incremental_news
+from refresh import prune_old_cache
 
 
 def _cache_row(link: str, publish_time: str, sector: str = "半导体芯片") -> dict:
@@ -49,6 +51,16 @@ def test_incremental_keeps_rows_without_link_for_later_dedup() -> None:
     fetched = pd.DataFrame([_cache_row("", "2026-07-05 11:00:00")])
     result = filter_incremental_news(existing, fetched)
     assert len(result) == 1
+
+
+def test_dedup_preserves_fetch_timestamp_for_retention_fallback(monkeypatch) -> None:
+    record = _cache_row("https://e.com/old", "")
+    cache = deduplicate_cache(pd.DataFrame([record, record]))
+    assert cache["fetched_at"].tolist() == [record["fetched_at"]]
+    monkeypatch.setattr(refresh, "now_utc8_naive", lambda: pd.Timestamp("2026-08-04 07:59"))
+    assert len(prune_old_cache(cache, retention_days=30)) == 1
+    monkeypatch.setattr(refresh, "now_utc8_naive", lambda: pd.Timestamp("2026-08-04 08:01"))
+    assert prune_old_cache(cache, retention_days=30).empty
 
 
 if __name__ == "__main__":

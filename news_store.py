@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Iterable
 
 import pandas as pd
@@ -132,18 +133,27 @@ def read_cache(path: Path = CACHE_PATH) -> CacheReadResult:
     return CacheReadResult(data=_normalize_cache_frame(df))
 
 
-def save_cache(df: pd.DataFrame, path: Path = CACHE_PATH) -> None:
+def save_cache(
+    df: pd.DataFrame, path: Path = CACHE_PATH, *, base_cache: pd.DataFrame | None = None
+) -> None:
     normalized = _normalize_cache_frame(df)
 
     store = get_supabase_store()
     if store is not None:
-        store.replace_all(normalized.to_dict("records"))
+        previous_rows = (
+            _normalize_cache_frame(base_cache).to_dict("records") if base_cache is not None else None
+        )
+        store.replace_all(normalized.to_dict("records"), previous_rows=previous_rows)
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
-    normalized.to_csv(tmp_path, index=False)
-    tmp_path.replace(path)
+    with NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+        tmp_path = Path(handle.name)
+    try:
+        normalized.to_csv(tmp_path, index=False)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def clear_cache(path: Path = CACHE_PATH) -> None:
@@ -216,9 +226,6 @@ def display_to_cache(
     related_sectors: str = "",
     reason: str = "",
 ) -> pd.DataFrame:
-    if fetched_at is None:
-        fetched_at = utc_now_iso()
-
     if news_df is None or news_df.empty:
         return empty_cache_frame()
 
@@ -245,7 +252,10 @@ def display_to_cache(
             "event_category": get_column_or_default("event_category", event_category),
             "related_sectors": get_column_or_default("related_sectors", related_sectors),
             "reason": get_column_or_default("reason", reason),
-            "fetched_at": fetched_at,
+            "fetched_at": (
+                fetched_at if fetched_at is not None else
+                get_column("fetched_at") if "fetched_at" in news_df else utc_now_iso()
+            ),
         }
     )
     return _normalize_cache_frame(cache_df)
@@ -364,6 +374,14 @@ def refilter_external_event_cache(
     return combine_cache_frames(kept_frames), tuple(warnings)
 
 
+def _deduplicate_cache_group(
+    group: pd.DataFrame, sector: str, news_type: str,
+) -> pd.DataFrame:
+    display = cache_to_display(group).drop(columns=["sector"])
+    display["fetched_at"] = group["fetched_at"].to_numpy()
+    return display_to_cache(sector, deduplicate_news(display), news_type=news_type)
+
+
 def deduplicate_cache(df: pd.DataFrame) -> pd.DataFrame:
     normalized = _normalize_cache_frame(df)
     if normalized.empty:
@@ -372,19 +390,11 @@ def deduplicate_cache(df: pd.DataFrame) -> pd.DataFrame:
     deduped_frames: list[pd.DataFrame] = []
     sector_news_df = normalized[normalized["news_type"].ne("external_event")]
     for sector, sector_df in sector_news_df.groupby("sector", sort=False):
-        display_df = cache_to_display(sector_df)
-        deduped_display = deduplicate_news(display_df.drop(columns=["sector"]))
-        deduped_frames.append(
-            display_to_cache(sector, deduped_display, news_type="sector_news")
-        )
+        deduped_frames.append(_deduplicate_cache_group(sector_df, sector, "sector_news"))
 
     external_df = normalized[normalized["news_type"].eq("external_event")]
     if not external_df.empty:
-        external_display = cache_to_display(external_df)
-        deduped_external = deduplicate_news(external_display.drop(columns=["sector"]))
-        deduped_frames.append(
-            display_to_cache("", deduped_external, news_type="external_event")
-        )
+        deduped_frames.append(_deduplicate_cache_group(external_df, "", "external_event"))
 
     return combine_cache_frames(deduped_frames)
 

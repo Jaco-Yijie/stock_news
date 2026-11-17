@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+from html import escape
 from typing import Any
 
 import pandas as pd
@@ -21,8 +23,11 @@ from analysis import (
     group_similar_news,
     parse_publish_times,
     sort_news_by_importance,
+    target_sectors_for_row,
 )
+from feedback_store import FeedbackItem, get_feedback_store
 from paths import DATA_DIR
+from news_links import safe_news_url
 from supabase_store import SupabaseConfigStore, load_supabase_credentials
 from time_utils import now_utc8_naive
 
@@ -45,10 +50,14 @@ def _clean_secret(value: str) -> str:
     return "".join(str(value or "").split())
 
 
-def _ensure_http_ok(response: requests.Response, channel: str) -> None:
+def _redact_secret(value: str, secret: str) -> str:
+    return value.replace(secret, "[已隐藏]") if secret else value
+
+
+def _ensure_http_ok(response: requests.Response, channel: str, secret: str) -> None:
     if response.status_code >= 400:
         raise RuntimeError(
-            f"{channel} HTTP {response.status_code}：{response.text[:200]}"
+            f"{channel} HTTP {response.status_code}：{_redact_secret(response.text, secret)[:200]}"
         )
 
 
@@ -63,29 +72,62 @@ class PushPlusNotifier:
         return format_push_markdown(df, overview)
 
     def send(self, title: str, content: str) -> None:
-        response = requests.post(
-            "https://www.pushplus.plus/send",
-            json={
-                "token": self._token,
-                "title": title,
-                "content": content,
-                "template": "markdown",
-            },
-            timeout=self._timeout,
-        )
-        _ensure_http_ok(response, self.name)
+        try:
+            response = requests.post(
+                "https://www.pushplus.plus/send",
+                json={
+                    "token": self._token,
+                    "title": title,
+                    "content": content,
+                    "template": "markdown",
+                },
+                timeout=self._timeout,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"PushPlus 网络请求失败（{type(exc).__name__}）") from None
+        _ensure_http_ok(response, self.name, self._token)
         payload = response.json()
         if payload.get("code") != 200:
-            raise RuntimeError(f"PushPlus 返回错误：{str(payload)[:200]}")
+            detail = _redact_secret(str(payload), self._token)[:200]
+            raise RuntimeError(f"PushPlus 返回错误：{detail}")
+
+
+class TelegramAPIError(RuntimeError):
+    pass
+
+
+class TelegramAPI:
+    def __init__(self, token: str, timeout: int = DEFAULT_TIMEOUT) -> None:
+        self._token = token
+        self._timeout = timeout
+
+    def call(self, method: str, body: dict[str, Any]) -> Any:
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{self._token}/{method}",
+                json=body, timeout=self._timeout,
+            )
+        except requests.RequestException as exc:
+            raise TelegramAPIError(f"Telegram 网络请求失败（{type(exc).__name__}）") from None
+        if response.status_code >= 400:
+            detail = _redact_secret(response.text, self._token)[:200]
+            raise TelegramAPIError(f"Telegram HTTP {response.status_code}：{detail}")
+        try:
+            payload = response.json()
+        except ValueError:
+            raise TelegramAPIError("Telegram 返回的响应格式无效") from None
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            detail = _redact_secret(str(payload), self._token)[:200]
+            raise TelegramAPIError(f"Telegram 返回错误：{detail}")
+        return payload.get("result")
 
 
 class TelegramNotifier:
     name = "Telegram"
 
     def __init__(self, bot_token: str, chat_id: str, timeout: int = DEFAULT_TIMEOUT) -> None:
-        self._url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        self._api = TelegramAPI(bot_token, timeout)
         self._chat_id = chat_id
-        self._timeout = timeout
 
     def render(self, df: pd.DataFrame, overview: str = "") -> str:
         return format_push_html(df, overview)
@@ -101,21 +143,86 @@ class TelegramNotifier:
         total = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
             text = chunk if total == 1 else f"{chunk}\n\n（{index}/{total}）"
-            response = requests.post(
-                self._url,
-                json={
-                    "chat_id": self._chat_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    # 十几条新闻各带一个链接，预览卡片会把消息撑得没法看
-                    "disable_web_page_preview": True,
-                },
-                timeout=self._timeout,
+            self._send_message(text)
+
+    def _send_message(self, text: str, buttons: list[list[dict[str, str]]] | None = None) -> None:
+        body: dict[str, Any] = {
+            "chat_id": self._chat_id, "text": text,
+            "parse_mode": "HTML", "disable_web_page_preview": True,
+        }
+        if buttons:
+            body["reply_markup"] = {"inline_keyboard": buttons}
+        self._api.call("sendMessage", body)
+
+    def send_news(self, title: str, df: pd.DataFrame, overview: str = "") -> None:
+        date = now_utc8_naive().date().isoformat()
+        blocks = []
+        for _, row in df.iterrows():
+            _, _, headline, _, _, link = _row_fields(row)
+            sectors = target_sectors_for_row(row)
+            sector = sectors[0] if len(sectors) == 1 else "外部事件"
+            blocks.append((_format_line_html(row), FeedbackItem.from_news(date, sector, headline, link)))
+        intro = f"{_escape_html(overview.strip())}\n\n———" if overview.strip() else ""
+        self._send_feedback_blocks(title, intro, blocks)
+
+    def send_digest(self, title: str, content: str, items: list[FeedbackItem]) -> None:
+        if not items or not re.fullmatch(r"-?[0-9]+", self._chat_id):
+            self.send(title, content)
+            return
+        blocks = [
+            (
+                f'<b>{escape(item.title)}</b>\n{escape(item.sector)} ｜ '
+                f'<a href="{escape(item.link, quote=True)}">原文</a>',
+                item,
             )
-            _ensure_http_ok(response, self.name)
-            payload = response.json()
-            if not payload.get("ok"):
-                raise RuntimeError(f"Telegram 返回错误：{str(payload)[:200]}")
+            for item in items
+        ]
+        self.send(title, content)
+        self._send_feedback_blocks(f"{title} · 新闻反馈", "", blocks, skip_if_unavailable=True)
+
+    def _send_feedback_blocks(
+        self, title: str, intro: str, blocks: list[tuple[str, FeedbackItem | None]], *,
+        skip_if_unavailable: bool = False,
+    ) -> None:
+        items = [item for _, item in blocks if item is not None]
+        if items and re.fullmatch(r"-?[0-9]+", self._chat_id):
+            try:
+                get_feedback_store().register(items)
+            except Exception as exc:
+                print(f"[warning] Telegram 反馈存储不可用（{type(exc).__name__}）")
+            else:
+                self._send_registered_blocks(title, intro, blocks)
+                return
+        if not skip_if_unavailable:
+            self.send(title, "\n\n".join(part for part in [intro, *(block for block, _ in blocks)] if part))
+
+    def _send_registered_blocks(
+        self, title: str, intro: str, blocks: list[tuple[str, FeedbackItem | None]]
+    ) -> None:
+        heading = f"<b>{_escape_html(title)}</b>"
+        current = f"{heading}\n\n{intro}" if intro else heading
+        buttons = []
+        for index, (block, item) in enumerate(blocks, 1):
+            if item is not None:
+                block = f"{index}. {block}"
+            if len(current) + len(block) + 2 > TELEGRAM_MESSAGE_LIMIT or len(buttons) == DAILY_REPORT_ITEMS:
+                if len(current) > TELEGRAM_MESSAGE_LIMIT:
+                    for chunk in _split_for_telegram(current):
+                        self._send_message(chunk)
+                elif current != heading:
+                    self._send_message(current, buttons)
+                current, buttons = heading, []
+            if len(heading) + len(block) + 2 > TELEGRAM_MESSAGE_LIMIT:
+                self.send(title, block)
+                continue
+            current += f"\n\n{block}"
+            if item is not None:
+                buttons.append([
+                    {"text": f"👍{index} 该留", "callback_data": f"keep:{item.id}"},
+                    {"text": f"👎{index} 不该留", "callback_data": f"drop:{item.id}"},
+                ])
+        if current != heading:
+            self._send_message(current, buttons)
 
 
 def load_notifiers_from_env() -> list[Any]:
@@ -140,7 +247,10 @@ def send_to_all(
     errors: list[str] = []
     for notifier in notifiers:
         try:
-            notifier.send(title, notifier.render(df, overview))
+            if isinstance(notifier, TelegramNotifier):
+                notifier.send_news(title, df, overview)
+            else:
+                notifier.send(title, notifier.render(df, overview))
         except Exception as exc:
             errors.append(f"{notifier.name}: {exc}")
     return errors
@@ -244,16 +354,21 @@ def _row_fields(row: pd.Series) -> tuple[str, str, str, str, str, str]:
     title = str(row.get("标题", "")).strip()[:MAX_TITLE_CHARS]
     source = str(row.get("来源媒体", "")).strip()
     publish_time = str(row.get("发布时间", "")).strip()
-    link = str(row.get("原文链接", "")).strip()
+    link = safe_news_url(row.get("原文链接"))
     return sentiment, sectors, title, source, publish_time, link
+
+
+def _escape_markdown(value: str) -> str:
+    return re.sub(r"([\\`*_{}\[\]()!<>])", r"\\\1", " ".join(value.split()))
 
 
 def _format_line(row: pd.Series) -> str:
     sentiment, sectors, title, source, publish_time, link = _row_fields(row)
+    destination = link.replace("(", "%28").replace(")", "%29")
     return (
-        f"**【{sentiment}】{title}**\n"
-        f"板块：{sectors} ｜ {source} {publish_time}\n"
-        f"[原文]({link})"
+        f"**【{sentiment}】{_escape_markdown(title)}**\n"
+        f"板块：{_escape_markdown(sectors)} ｜ {_escape_markdown(source)} {publish_time}"
+        + (f"\n[原文]({destination})" if destination else "")
     )
 
 
@@ -262,8 +377,8 @@ def _format_line_html(row: pd.Series) -> str:
     return (
         f"<b>【{sentiment}】{_escape_html(title)}</b>\n"
         f"板块：{_escape_html(sectors)} ｜ {_escape_html(source)} "
-        f"{_escape_html(publish_time)}\n"
-        f'<a href="{_escape_html(link)}">原文</a>'
+        f"{_escape_html(publish_time)}"
+        + (f'\n<a href="{escape(link, quote=True)}">原文</a>' if link else "")
     )
 
 
@@ -382,7 +497,7 @@ def push_daily_report(cache_df: pd.DataFrame, llm_verifier: Any = None) -> None:
             )
             overview = " ".join(str(overview or "").split())
         except Exception as exc:
-            print(f"[warning] 早报 LLM 总览生成失败：{exc}")
+            print(f"[warning] 早报 LLM 总览生成失败（{type(exc).__name__}）")
             overview = ""
 
     now = now_utc8_naive()

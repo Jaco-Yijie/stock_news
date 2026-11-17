@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 from typing import Any
 
@@ -117,12 +118,10 @@ class _SupabaseTable:
                 timeout=self._timeout,
             )
         except requests.RequestException as exc:
-            raise SupabaseError(f"Supabase 请求失败：{exc}") from exc
+            raise SupabaseError(f"Supabase 请求失败（{type(exc).__name__}）") from None
 
         if response.status_code >= 400:
-            raise SupabaseError(
-                f"Supabase 返回错误 {response.status_code}：{response.text[:200]}"
-            )
+            raise SupabaseError(f"Supabase 返回错误（HTTP {response.status_code}）")
         return response
 
 class SupabaseNewsStore(_SupabaseTable):
@@ -197,15 +196,21 @@ class SupabaseNewsStore(_SupabaseTable):
             if row.get("id")
         }
 
-    def replace_all(self, rows: list[dict[str, Any]]) -> None:
-        new_ids: set[str] = set()
+    def replace_all(
+        self, rows: list[dict[str, Any]], *, previous_rows: list[dict[str, Any]] | None = None
+    ) -> None:
         deduped_rows: dict[str, dict[str, Any]] = {}
         for row in rows:
             row_id = news_row_id(row)
             deduped_rows[row_id] = {**row, "id": row_id}
-        new_ids = set(deduped_rows)
-
-        payload = list(deduped_rows.values())
+        if previous_rows is None:
+            payload = list(deduped_rows.values())
+        else:
+            previous_by_id = {news_row_id(row): row for row in previous_rows}
+            payload = [
+                row for row_id, row in deduped_rows.items()
+                if row != {**previous_by_id.get(row_id, {}), "id": row_id}
+            ]
         # 先写入新数据再删除过期行，中途失败时不会丢掉整个缓存
         for start in range(0, len(payload), UPSERT_CHUNK_SIZE):
             chunk = payload[start : start + UPSERT_CHUNK_SIZE]
@@ -217,7 +222,8 @@ class SupabaseNewsStore(_SupabaseTable):
                 },
             )
 
-        stale_ids = sorted(self.fetch_ids() - new_ids)
+        existing_ids = self.fetch_ids() if previous_rows is None else set(previous_by_id)
+        stale_ids = sorted(existing_ids - deduped_rows.keys())
         for start in range(0, len(stale_ids), DELETE_CHUNK_SIZE):
             chunk = stale_ids[start : start + DELETE_CHUNK_SIZE]
             self._request("DELETE", params={"id": f"in.({','.join(chunk)})"})
@@ -252,9 +258,41 @@ class SupabaseConfigStore(_SupabaseTable):
             return str(rows[0].get("value", "") or "") or None
         return None
 
-    def set_value(self, config_key: str, value: str) -> None:
+    def set_value(self, config_key: str, value: str, *, overwrite: bool = True) -> None:
+        self.set_values({config_key: value}, overwrite=overwrite)
+
+    def set_values(self, values: dict[str, str], *, overwrite: bool = True) -> None:
+        if not values:
+            return
+        resolution = "merge-duplicates" if overwrite else "ignore-duplicates"
         self._request(
             "POST",
-            json_body=[{"key": config_key, "value": value}],
-            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            json_body=[{"key": key, "value": value} for key, value in values.items()],
+            headers={"Prefer": f"resolution={resolution},return=minimal"},
         )
+
+    def list_values(self, prefix: str) -> list[str]:
+        if not re.fullmatch(r"[a-z0-9-]+", prefix):
+            raise ValueError("配置键前缀不合法")
+        values = []
+        last = ""
+        while True:
+            params = {"select": "key,value", "order": "key.asc", "limit": "500"}
+            if last:
+                params["and"] = f"(key.like.{prefix}*,key.gt.{last})"
+            else:
+                params["key"] = f"like.{prefix}*"
+            rows = self._request("GET", params=params).json()
+            if not isinstance(rows, list):
+                raise SupabaseError("Supabase 配置分页格式无效")
+            if not rows:
+                return values
+            for row in rows:
+                key, value = row.get("key"), row.get("value")
+                if (
+                    not isinstance(key, str) or not re.fullmatch(r"[a-z0-9-]+", key)
+                    or not key.startswith(prefix) or key <= last or not isinstance(value, str)
+                ):
+                    raise SupabaseError("Supabase 配置分页键无效")
+                values.append(value)
+                last = key

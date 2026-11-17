@@ -1,27 +1,19 @@
-"""Agent 编排层：W2 最小闭环。
-
-定位：抓取、去重、排序、日报生成仍是确定性工具调用（复用 tools/ 包）；
-「每条候选新闻去留」这个模糊判断交给 Agent 决策循环。
-
-为什么不引入 LangGraph：现阶段节点是线性流水线 + 一个决策循环，
-llm_provider.complete() 是纯文本接口，用 JSON 协议自制 ReAct 循环
-（本文件 ~120 行）即可跑通所有模型供应商，零新增重依赖，全部可单测。
-W3 加入 Planner / Critic / 重试分支后，图结构变复杂再迁 LangGraph，
-届时 nodes 函数签名（state -> state）无需改动。
-
-LLM 可注入：生产用 llm_provider.load_llm_verifier_from_env()，
-测试传 fake callable，所有测试不触网。
-"""
+"""编排板块新闻的 Planner、ReAct 决策、Critic 与日报工具。"""
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from html import escape
+from pathlib import Path
+from typing import Any, Protocol
 
 from agent import prompts
 from tools import call_tool, tool_specs
+
+logger = logging.getLogger(__name__)
 
 
 class ChatLLM(Protocol):
@@ -34,6 +26,16 @@ class ChatLLM(Protocol):
 EXECUTOR_ALLOWED_TOOLS = ("classify_news", "search_history")
 
 DEFAULT_MAX_TOOL_CALLS_PER_SECTOR = 12
+
+
+@dataclass
+class DecisionLLM:
+    llm: ChatLLM
+    calls: int = 0
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        self.calls += 1
+        return self.llm.complete(system_prompt, user_prompt)
 
 
 @dataclass
@@ -54,6 +56,7 @@ class SectorResult:
     agent_reason: str = ""
     agent_fallback: bool = False  # Agent 决策失败时是否走了规则兜底
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    llm_calls: int = 0
     error: str | None = None
 
 
@@ -73,13 +76,14 @@ class AgentReport:
             "kept": sum(len(s.kept) for s in self.sectors),
             "fallback_sectors": sum(1 for s in self.sectors if s.agent_fallback),
             "tool_calls": sum(len(s.tool_calls) for s in self.sectors),
+            "llm_calls": sum(s.llm_calls for s in self.sectors),
             "digests": len(self.digests),
             "pushed": self.pushed,
         }
 
 
-def _parse_agent_action(text: str) -> dict[str, Any] | None:
-    """从模型输出中提取 JSON 动作。容忍 ```json 围栏和首尾噪声。"""
+def _parse_model_object(text: str) -> dict[str, Any] | None:
+    """从模型输出中提取 JSON 对象，容忍代码围栏和首尾噪声。"""
     if not text:
         return None
     candidate = text.strip()
@@ -95,7 +99,55 @@ def _parse_agent_action(text: str) -> dict[str, Any] | None:
         data = json.loads(candidate)
     except json.JSONDecodeError:
         return None
-    return data if isinstance(data, dict) and "action" in data else None
+    return data if isinstance(data, dict) else None
+
+
+def _parse_agent_action(text: str) -> dict[str, Any] | None:
+    data = _parse_model_object(text)
+    return data if data is not None and "action" in data else None
+
+
+def _plan_sector(
+    sector: str, candidates: list[dict[str, Any]], llm: ChatLLM
+) -> dict[str, str] | None:
+    payload = {"sector": sector, "titles": [item["title"] for item in candidates[:5]]}
+    try:
+        plan = _parse_model_object(
+            llm.complete(prompts.PLANNER_SYSTEM_PROMPT, json.dumps(payload, ensure_ascii=False))
+        )
+        if plan is None or not all(
+            isinstance(plan.get(key), str) and plan[key].strip()
+            for key in ("focus", "tool_strategy")
+        ):
+            raise ValueError("无效的计划")
+    except Exception as exc:
+        logger.warning("板块「%s」Planner 已跳过（%s）", sector, type(exc).__name__)
+        return None
+    return {key: plan[key].strip()[:500] for key in ("focus", "tool_strategy")}
+
+
+def _review_selection(
+    sector: str, kept: list[dict[str, Any]], examples: list[str], llm: ChatLLM
+) -> tuple[list[str], str]:
+    payload = {
+        "sector": sector,
+        "selected": [{"id": item["id"], "title": item["title"]} for item in kept],
+        "past_false_positives": examples,
+    }
+    try:
+        review = _parse_model_object(
+            llm.complete(prompts.CRITIC_SYSTEM_PROMPT, json.dumps(payload, ensure_ascii=False))
+        )
+        if review is None or not isinstance(review.get("reason"), str):
+            raise ValueError("无效的复核结果")
+        remove_ids = review.get("remove_ids")
+        if not isinstance(remove_ids, list) or not all(isinstance(item, str) for item in remove_ids):
+            raise ValueError("无效的复核编号")
+    except Exception as exc:
+        logger.warning("板块「%s」Critic 已跳过（%s）", sector, type(exc).__name__)
+        return [], ""
+    removed = set(remove_ids)
+    return [item["id"] for item in kept if item["id"] in removed], review["reason"][:500]
 
 
 def _tool_docs() -> str:
@@ -112,6 +164,8 @@ def decide_sector_news(
     candidates: list[dict[str, Any]],
     llm: ChatLLM,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS_PER_SECTOR,
+    *,
+    plan: dict[str, str] | None = None,
 ) -> tuple[list[str], str, list[ToolCallRecord]]:
     """Agent 决策循环：返回 (保留的id列表, 决策理由, 工具调用记录)。
 
@@ -127,17 +181,26 @@ def decide_sector_news(
         tool_docs=_tool_docs(), budget=max_tool_calls
     )
 
+    base_user = prompts.executor_user_prompt(sector, candidates)
+    if plan is not None:
+        base_user += "\n\nPlanner 的参考建议（仍须遵守分类规则和工具预算）：\n"
+        base_user += json.dumps(plan, ensure_ascii=False)
     for _round in range(max_tool_calls + 4):  # 预留几轮给 final 输出
-        user = prompts.executor_user_prompt(sector, candidates)
+        user = base_user
         if observations:
             user += "\n\n已获得的工具结果：\n" + "\n".join(observations)
 
-        action = _parse_agent_action(llm.complete(system, user))
+        try:
+            action = _parse_agent_action(llm.complete(system, user))
+        except Exception as exc:
+            raise AgentDecisionError(f"模型调用失败（{type(exc).__name__}）") from exc
         if action is None:
             continue  # 输出无法解析，原样重试（temperature=0 时最多空转，受轮数上限保护）
 
         if action["action"] == "final":
-            kept = [str(i) for i in action.get("kept_ids", [])]
+            kept = action.get("kept_ids")
+            if not isinstance(kept, list) or not all(isinstance(i, str) for i in kept):
+                continue
             valid = {c["id"] for c in candidates}
             return [i for i in kept if i in valid], str(action.get("reason", "")), tool_calls
 
@@ -171,13 +234,21 @@ def run_agent(
     llm: ChatLLM | None,
     push: bool = False,
     max_tool_calls_per_sector: int = DEFAULT_MAX_TOOL_CALLS_PER_SECTOR,
+    *,
+    bad_cases_path: str | Path | None = None,
+    feedback_cases_path: str | Path | None = None,
+    compare: bool = False,
 ) -> AgentReport:
-    """W2 主流程：固定流水线，分类决策交给 Agent。
-
-    每板块：fetch → filter_new_news → Agent 决策去留 → rank → compose_digest。
-    Agent 失败（未配置 LLM / 决策异常）时回退到规则分类，保证日报不缺席。
-    """
+    """先复核分类决策，再排序生成日报；仅对比运行记录用于评测的候选快照。"""
     report = AgentReport(date=date)
+    examples: dict[str, list[str]] = {}
+    if llm is not None:
+        from agent.bad_case import false_positive_examples
+
+        try:
+            examples = false_positive_examples(bad_cases_path, before=date, feedback_path=feedback_cases_path)
+        except (OSError, ValueError) as exc:
+            logger.warning("无法读取 bad case，Critic 将不使用历史样例（%s）", type(exc).__name__)
 
     for sector in sectors:
         result = SectorResult(sector=sector)
@@ -186,37 +257,61 @@ def run_agent(
         if fetched.get("error"):
             result.error = f"fetch: {fetched['error']}"
             report.sectors.append(result)
+            if compare:
+                report.trace.append({"sector": sector, "snapshot_error": "抓取失败"})
             continue
         items = fetched.get("items", [])
         result.fetched = len(items)
 
         fresh = call_tool("filter_new_news", {"items": items})
+        if fresh.get("error"):
+            result.error = f"filter_new_news: {fresh['error']}"
+            logger.warning("板块「%s」增量过滤失败，继续使用返回的候选新闻", sector)
         candidates = fresh.get("items", [])
         result.after_dedupe = len(candidates)
-        for idx, item in enumerate(candidates):
-            # 展示层字段为中文（标题/新闻内容/发布时间/原文链接）
-            item["id"] = f"n{idx}"
-            item["title"] = item.get("标题", "")
-            item["summary"] = item.get("新闻内容", "")
+        candidates = [
+            {**item, "id": f"n{idx}", "title": item.get("标题") or "",
+             "summary": item.get("新闻内容") or ""}
+            for idx, item in enumerate(candidates)
+        ]
 
-        if not candidates:
-            report.sectors.append(result)
-            continue
-
-        if llm is None:
+        plan = None
+        critic_removed: list[str] = []
+        critic_reason = ""
+        if candidates and llm is None:
             _rule_fallback(result, candidates, reason="未配置 LLM")
-        else:
+        elif candidates and llm is not None:
+            decision_llm = DecisionLLM(llm)
+            plan = _plan_sector(sector, candidates, decision_llm)
             try:
                 kept_ids, reason, records = decide_sector_news(
-                    sector, candidates, llm, max_tool_calls=max_tool_calls_per_sector
+                    sector, candidates, decision_llm, max_tool_calls=max_tool_calls_per_sector,
+                    plan=plan,
                 )
                 result.tool_calls = records
                 result.agent_reason = reason
                 kept_set = set(kept_ids)
                 result.kept = [c for c in candidates if c["id"] in kept_set]
+                if result.kept:
+                    critic_removed, critic_reason = _review_selection(
+                        sector, result.kept, examples.get(sector, []), decision_llm
+                    )
+                    kept_set.difference_update(critic_removed)
+                    result.kept = [c for c in result.kept if c["id"] in kept_set]
                 result.dropped_ids = [c["id"] for c in candidates if c["id"] not in kept_set]
             except AgentDecisionError as exc:
                 _rule_fallback(result, candidates, reason=str(exc))
+            result.llm_calls = decision_llm.calls
+
+        snapshot = {}
+        if compare and fresh.get("error"):
+            snapshot = {"snapshot_error": "增量过滤失败"}
+        elif compare:
+            snapshot = {
+                "candidate_items": [_trace_item(item) for item in candidates],
+                "agent_selected": [_trace_item(item) for item in result.kept],
+                "rules_selected": _rules_snapshot(sector, candidates),
+            }
 
         if result.kept:
             analyzed = []
@@ -244,34 +339,65 @@ def run_agent(
                 "fetched": result.fetched,
                 "after_dedupe": result.after_dedupe,
                 "kept": len(result.kept),
-                "kept_items": [
-                    {
-                        "id": item.get("id", ""),
-                        "title": item.get("title", ""),
-                        "link": item.get("原文链接", ""),
-                    }
-                    for item in result.kept
-                ],
+                "kept_items": [_trace_item(item) for item in result.kept],
                 "agent_fallback": result.agent_fallback,
                 "agent_reason": result.agent_reason,
+                "plan": plan,
+                "critic_removed": critic_removed,
+                "critic_reason": critic_reason,
+                "llm_calls": result.llm_calls,
                 "tool_calls": [
                     {"tool": r.tool, "ok": r.ok, "latency_ms": r.latency_ms}
                     for r in result.tool_calls
                 ],
+                **snapshot,
             }
         )
 
     if push and report.digests:
         content = "\n\n".join(
-            f"<b>{sector}</b>\n{text}" for sector, text in report.digests.items()
+            f"<b>{escape(sector)}</b>\n{escape(text)}" for sector, text in report.digests.items()
         )
         pushed = call_tool(
             "push_telegram",
-            {"title": f"板块日报 {date}", "content": content},
+            {
+                "title": f"板块日报 {date}", "content": content,
+                "feedback_items": [
+                    {"date": date, "sector": result.sector, "title": item["title"],
+                     "link": item.get("原文链接", "")}
+                    for result in report.sectors if report.digests.get(result.sector)
+                    for item in result.kept
+                ],
+            },
         )
         report.pushed = not pushed.get("error")
 
     return report
+
+
+def _trace_item(item: dict[str, Any]) -> dict[str, str]:
+    return {
+        "id": item.get("id", ""),
+        "title": item.get("title", ""),
+        "link": item.get("原文链接", ""),
+    }
+
+
+def _rules_snapshot(
+    sector: str, candidates: list[dict[str, Any]]
+) -> list[dict[str, str]] | None:
+    selected = []
+    for item in candidates:
+        classified = call_tool("classify_news", {
+            "sector": sector, "title": item["title"], "content": item["summary"],
+            "use_llm": False,
+        })
+        if classified.get("error"):
+            logger.warning("板块「%s」规则侧分类失败，本次跳过比较", sector)
+            return None
+        if classified.get("matched"):
+            selected.append(_trace_item(item))
+    return selected
 
 
 def _rule_fallback(result: SectorResult, candidates: list[dict[str, Any]], reason: str) -> None:

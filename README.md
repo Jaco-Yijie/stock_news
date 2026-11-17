@@ -71,6 +71,10 @@ http://localhost:8501
 - Streamlit-based web dashboard
 - Deployment-ready with configurable `DATA_DIR`
 
+利好利空规则优先判断标题中的已确认事件。标题没有明确方向时才用正文补充。
+价格、货币政策和贸易事件按相关板块判断；同一条新闻对上下游方向相反时，
+看板同时显示各板块方向和整体中性判断。
+
 ## Streamlit Community Cloud Deployment
 
 推荐优先使用 Streamlit Community Cloud。
@@ -87,6 +91,28 @@ http://localhost:8501
 - Streamlit Community Cloud 12 小时无访问会休眠。
 - Streamlit Cloud 上的本地 `./data` 文件不适合长期线上持久化；应用重建、重启或环境变化时，本地文件缓存和在线编辑的配置可能丢失。
 - 新闻缓存持久化已支持 Supabase：配置 `SUPABASE_URL` 和 `SUPABASE_KEY` 后缓存保存在 Supabase Postgres 中，重启不丢失。配置步骤见 [DEPLOY.md](DEPLOY.md)。
+
+## Agent 对比与 bad case 评测
+
+```bash
+python -m agent.run_agent --sectors 半导体芯片 人工智能 --dry-run --compare
+python -m agent.compare_report
+python -m agent.bad_case stats
+python -m agent.bad_case evaluate --trace agent_trace.jsonl
+```
+
+- 两侧使用同批候选，比较排序取前 10 条之前的分类结果。报告分别统计决策模型和工具调用。
+- 对比报告把正常走模型决策的差异加入 `data/bad_cases.jsonl`。旧 trace 或规则兜底产生的差异不会入库。
+- 人工审核后，将 `type` 从 `pending` 改为 `miss`（应该保留但被剔除）、`false_positive`（不该保留但被保留）或 `dismissed`（差异合理），在 `note` 记录判断依据。同一板块和链接的既有标签会保留。
+- Critic 会读取同板块最多 10 条已确认的 `false_positive` 标题。评测命令按候选快照核对人工标注的去留，输出通过、失败和未覆盖数量。
+- Actions 的对比任务会随报告上传当次的案例文件。可下载其中的报告和 trace，用 `python -m agent.bad_case collect --report <下载的报告路径>` 合并到本地人工标注库。正式比对前需在运行环境配置已有的 LLM 环境变量。
+
+### Telegram 人工反馈
+
+- 重要新闻和早报按条目编号显示「该留／不该留」按钮。Agent 日报会另发一条带原文链接的审核列表。
+- 「该留」记录为 `kept`，「不该留」记录为 `false_positive`。同一聊天、同一天、同一板块和链接保留最近一次选择。漏推（`miss`）由对比报告审核。
+- `python feedback_bot.py --export` 将反馈导出为 `data/telegram_feedback_cases.jsonl`。Agent 与离线评测默认读取此文件。同一案例有已审核的本地标签时，以本地标签为准。
+- Actions 的对比任务在已配置 Supabase 时自动读取反馈。反馈 JSONL 保存在当前运行环境，不作为 Actions 产物上传。部署步骤见 [DEPLOY.md](DEPLOY.md#telegram-人工反馈)。
 
 ## Project Structure
 

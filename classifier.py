@@ -413,7 +413,7 @@ def validate_classification_with_llm(
             should_keep,
             category,
             result.confidence if should_keep else 0.0,
-            f"LLM 校验 JSON 解析失败或调用失败：{exc}",
+            f"LLM 校验 JSON 解析失败或调用失败（{type(exc).__name__}）",
         )
 
     if cache is not None:

@@ -4,7 +4,10 @@ from __future__ import annotations
 from typing import Any
 
 import supabase_store
-from supabase_store import PAGE_SIZE, SupabaseError, SupabaseNewsStore, get_shared_session
+from supabase_store import (
+    PAGE_SIZE, SupabaseConfigStore, SupabaseError, SupabaseNewsStore,
+    get_shared_session, news_row_id,
+)
 
 
 class FakeResponse:
@@ -79,6 +82,54 @@ def test_fetch_all_handles_empty_table() -> None:
     session = FakeSession([])
     assert _store(session).fetch_all() == []
     assert len(session.calls) == 1
+
+
+def test_replace_all_deletes_only_rows_seen_in_base_snapshot(monkeypatch) -> None:
+    store = _store(FakeSession([{"id": "created-by-another-writer"}]))
+    calls = []
+    monkeypatch.setattr(store, "_request", lambda method, **kwargs: calls.append((method, kwargs)))
+    unchanged = {"title": "既有新闻"}
+    stale = {"title": "本次确认要删除的旧新闻"}
+    store.replace_all([unchanged, {"title": "新新闻"}], previous_rows=[unchanged, stale])
+
+    assert [method for method, _ in calls] == ["POST", "DELETE"]
+    assert [row["title"] for row in calls[0][1]["json_body"]] == ["新新闻"]
+    assert calls[1][1]["params"] == {"id": f"in.({news_row_id(stale)})"}
+
+
+def test_config_migration_uses_insert_without_overwriting(monkeypatch) -> None:
+    store = SupabaseConfigStore("https://example.supabase.co", "test-key", session=FakeSession([]))
+    headers = []
+    monkeypatch.setattr(store, "_request", lambda method, **kwargs: headers.append(kwargs["headers"]))
+    store.set_value("sectors_config", "{}", overwrite=False)
+    store.set_value("sectors_config", "{}")
+    assert [item["Prefer"] for item in headers] == [
+        "resolution=ignore-duplicates,return=minimal",
+        "resolution=merge-duplicates,return=minimal",
+    ]
+
+
+def test_config_prefix_listing_survives_server_page_cap(monkeypatch) -> None:
+    store = SupabaseConfigStore("https://example.supabase.co", "test-key", session=FakeSession([]))
+    calls = []
+    responses = iter([
+        [{"key": "telegram-feedback-vote-a", "value": "first"}],
+        [{"key": "telegram-feedback-vote-b", "value": "second"}],
+        [],
+    ])
+
+    def request(method, *, params):
+        calls.append(params)
+        assert method == "GET"
+        return FakeResponse(next(responses))
+
+    monkeypatch.setattr(store, "_request", request)
+    assert store.list_values("telegram-feedback-vote-") == ["first", "second"]
+    assert calls[0]["key"] == "like.telegram-feedback-vote-*"
+    assert [call["and"] for call in calls[1:]] == [
+        "(key.like.telegram-feedback-vote-*,key.gt.telegram-feedback-vote-a)",
+        "(key.like.telegram-feedback-vote-*,key.gt.telegram-feedback-vote-b)",
+    ]
 
 
 def test_fetch_paged_without_id_raises_clear_error() -> None:

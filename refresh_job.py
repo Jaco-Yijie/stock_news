@@ -45,12 +45,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="跳过重要新闻推送（默认在配置了推送通道时自动推送）",
     )
+    parser.add_argument("--require-supabase", action="store_true",
+                        help="没有 Supabase 持久化时终止任务")
     parser.add_argument(
         "--daily-report",
         action="store_true",
         help="刷新完成后推送每日早报（最近 24 小时要闻 Top 榜）",
     )
     args = parser.parse_args(argv)
+    backend = cache_backend_name()
+    if args.require_supabase and backend != "Supabase":
+        print("[error] 缺少 Supabase 持久化配置，未运行刷新。")
+        return 1
 
     sectors_config, sectors_config_error = try_load_sectors_config()
     events_config, events_config_error = try_load_events_config()
@@ -62,7 +68,6 @@ def main(argv: list[str] | None = None) -> int:
     if llm_notice:
         print(f"[info] {llm_notice}")
 
-    backend = cache_backend_name()
     selected_sectors = list(sectors_config)
     print(
         f"[info] 缓存后端：{backend}，模式：{args.mode}，"
@@ -93,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
 
     final_cache = prune_old_cache(outcome.cache, args.retention_days)
     pruned_count = len(outcome.cache) - len(final_cache)
-    save_cache(final_cache)
+    save_cache(final_cache, base_cache=outcome.base_cache)
     print(
         f"[info] 完成：新增 {outcome.added_count} 条，"
         f"清理过期 {pruned_count} 条，缓存共 {len(final_cache)} 条。"

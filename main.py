@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import os
 from html import escape
 from typing import Any
 
@@ -37,6 +40,7 @@ from analysis_rules import CATEGORY_LABELS
 from digest import build_digest_records, generate_sector_digest
 from fetcher import SectorResult, deduplicate_news
 from llm_provider import load_llm_verifier_from_env
+from news_links import safe_news_url
 from news_store import (
     cache_fingerprint,
     cache_metadata,
@@ -750,21 +754,19 @@ def llm_verifier_cache_key(llm_verifier: LLMVerifier | None) -> str:
     )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=16, show_spinner=False)
 def get_cache_fingerprint(cache_version: int) -> str:
     """每分钟最多探测一次数据指纹；后台抓取写入新数据后，
     指纹变化会自动触发下方展示缓存重新加载。"""
     return cache_fingerprint()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, max_entries=8, show_spinner=False)
 def load_display_data(
     cache_version: int,
     fingerprint: str,
     sectors_config: dict[str, Any],
     external_events: dict[str, Any],
-    llm_cache_key: str,
-    _llm_verifier: LLMVerifier | None,
 ):
     """读取缓存并完成重过滤、格式转换、去重。
 
@@ -776,7 +778,6 @@ def load_display_data(
         cache_result.data,
         external_events,
         sectors_config=sectors_config,
-        llm_verifier=_llm_verifier,
     )
     display_df = cache_to_display(cache_df)
     sector_display_df = deduplicate_display_news(
@@ -1102,13 +1103,12 @@ def related_reports_html(related_rows: list[pd.Series]) -> str:
         return ""
     items = []
     for row in related_rows[:8]:
-        title = escape(str(row.get("标题", "")))
+        title = news_link_html(row.get("原文链接"), str(row.get("标题", "")), css_class="")
         source = escape(str(row.get("来源媒体", "")))
         publish_time = escape(str(row.get("发布时间", "")))
-        link = escape(str(row.get("原文链接", "")), quote=True)
         items.append(
             f'<div class="related-item">'
-            f'<a href="{link}" target="_blank" rel="noopener noreferrer">{title}</a>'
+            f"{title}"
             f"<span>{source} · {publish_time}</span></div>"
         )
     return (
@@ -1116,6 +1116,17 @@ def related_reports_html(related_rows: list[pd.Series]) -> str:
         f"<summary>另有 {len(related_rows)} 条相关报道</summary>"
         + "".join(items)
         + "</details>"
+    )
+
+
+def news_link_html(value: object, label: str = "查看原文", css_class: str = "news-link") -> str:
+    url = safe_news_url(value)
+    text = escape(label)
+    if not url:
+        return text if not css_class else ""
+    return (
+        f'<a class="{css_class}" href="{escape(url, quote=True)}" '
+        f'target="_blank" rel="noopener noreferrer">{text}</a>'
     )
 
 
@@ -1128,7 +1139,7 @@ def render_news_item(
     source = escape(str(row.get("来源媒体", "")))
     publish_time = escape(str(row.get("发布时间", "")))
     keyword = escape(str(row.get("匹配关键词", "")))
-    link = escape(str(row.get("原文链接", "")), quote=True)
+    link = news_link_html(row.get("原文链接"))
     reason = escape(_row_reason(row))
 
     return f"""
@@ -1142,7 +1153,7 @@ def render_news_item(
             </div>
             <div class="news-reason">
                 <span>判断：{reason}</span>
-                <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">查看原文</a>
+                {link}
             </div>
             {related_reports_html(related_rows or [])}
         </article>
@@ -1160,7 +1171,7 @@ def render_external_event_item(
     keyword = escape(str(row.get("匹配关键词", "")))
     event_category = escape(str(row.get("event_category", "")))
     related_sectors = escape(str(row.get("related_sectors", "") or "未映射"))
-    link = escape(str(row.get("原文链接", "")), quote=True)
+    link = news_link_html(row.get("原文链接"))
     reason = escape(_row_reason(row))
 
     return f"""
@@ -1176,7 +1187,7 @@ def render_external_event_item(
             </div>
             <div class="news-reason">
                 <span>判断：{reason}</span>
-                <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">查看原文</a>
+                {link}
             </div>
             {related_reports_html(related_rows or [])}
         </article>
@@ -1188,7 +1199,7 @@ def render_hot_news_item(row: pd.Series) -> str:
     title = escape(str(row.get("标题", "")))
     source = escape(str(row.get("来源媒体", "")))
     publish_time = escape(str(row.get("发布时间", "")))
-    link = escape(str(row.get("原文链接", "")), quote=True)
+    link = news_link_html(row.get("原文链接"))
     reason = escape(str(analysis.get("reason", "")))
     sectors = list((analysis.get("sector_assessments") or {}))
     sectors_text = escape("、".join(sectors) if sectors else "暂无明确映射")
@@ -1213,7 +1224,7 @@ def render_hot_news_item(row: pd.Series) -> str:
             <div class="hot-sectors">影响板块：{sectors_text}</div>
             <div class="news-reason">
                 <span>判断：{reason}</span>
-                <a class="news-link" href="{link}" target="_blank" rel="noopener noreferrer">查看原文</a>
+                {link}
             </div>
         </article>
         """
@@ -1243,23 +1254,24 @@ def describe_llm_error(exc: Exception) -> str:
     if isinstance(exc, requests.HTTPError):
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", "")
-        body = str(getattr(response, "text", ""))[:200]
         if status == 401:
-            return f"鉴权失败（401）：API Key 无效或已过期。{body}"
+            return "鉴权失败（401）：API Key 无效或已过期。"
         if status == 404:
-            return f"接口不存在（404）：检查 *_ENDPOINT 与 *_MODEL 是否匹配。{body}"
+            return "接口不存在（404）：检查 *_ENDPOINT 与 *_MODEL 是否匹配。"
         if status == 429:
-            return f"触发限流（429）：账户额度或并发不足。{body}"
-        return f"接口返回 {status}：{body}"
+            return "触发限流（429）：账户额度或并发不足。"
+        return f"模型接口请求失败（HTTP {status}）。"
     if isinstance(exc, requests.RequestException):
-        return f"网络请求失败：{exc}"
-    return f"{type(exc).__name__}: {exc}"
+        return f"网络请求失败（{type(exc).__name__}）。"
+    return f"生成失败（{type(exc).__name__}）。"
 
 
 def render_daily_digest_section(
     llm_verifier: LLMVerifier | None,
     selected_sectors: list[str],
     sector_deduped_df: pd.DataFrame,
+    *,
+    can_generate: bool,
 ) -> None:
     with st.expander("今日板块日报（LLM 生成）", expanded=False):
         if llm_verifier is None:
@@ -1267,6 +1279,9 @@ def render_daily_digest_section(
                 "未配置 LLM，无法生成日报。在环境变量或 Secrets 中配置 "
                 "LLM_VERIFY_PROVIDER 及豆包 / DeepSeek 密钥后可用。"
             )
+            return
+        if not can_generate:
+            st.caption("管理员登录后可生成日报。")
             return
         if not selected_sectors:
             st.info("请先选择板块。")
@@ -1709,10 +1724,6 @@ def render_data_refresh_controls(
     llm_verifier: LLMVerifier | None,
     show_external_events: bool,
 ) -> None:
-    if st.button("重新加载缓存"):
-        st.session_state.cache_version += 1
-    st.caption("页面每分钟自动检测后台数据更新；点击可立即重新加载。")
-
     last_refresh_at = st.session_state.get("last_refresh_at", "")
     if last_refresh_at:
         st.caption(
@@ -1736,7 +1747,7 @@ def render_data_refresh_controls(
                     )
                     st.stop()
                 try:
-                    save_cache(outcome.cache)
+                    save_cache(outcome.cache, base_cache=outcome.base_cache)
                 except Exception as exc:
                     st.error(f"缓存保存失败，本次抓取结果未持久化：{exc}")
                 else:
@@ -1757,15 +1768,18 @@ def render_data_refresh_controls(
                     external_events,
                     event_to_sectors,
                     llm_verifier=llm_verifier,
+                    preserve_unselected=True,
                 )
-                if outcome.fetch_failed:
+                if outcome.read_error:
+                    st.error("读取现有缓存失败，已保留原缓存。")
+                elif outcome.fetch_failed:
                     st.session_state.last_added_count = 0
                     st.session_state.last_sector_warnings = outcome.sector_warnings
                     st.session_state.last_external_warnings = outcome.event_warnings
                     st.warning("全量刷新未获取到有效数据，已保留原缓存。")
                 else:
                     try:
-                        save_cache(outcome.cache)
+                        save_cache(outcome.cache, base_cache=outcome.base_cache)
                     except Exception as exc:
                         st.error(f"缓存保存失败，本次抓取结果未持久化：{exc}")
                     else:
@@ -1773,7 +1787,8 @@ def render_data_refresh_controls(
                         st.session_state.last_sector_warnings = outcome.sector_warnings
                         st.session_state.last_external_warnings = outcome.event_warnings
                         st.session_state.cache_version += 1
-                        st.success(f"全量刷新完成，缓存已重建为 {outcome.added_count} 条新闻。")
+                        st.success(f"全量刷新完成，获取 {outcome.added_count} 条新闻，"
+                                   f"缓存共 {len(outcome.cache)} 条。")
         else:
             st.warning("请至少选择一个板块，或切换为显示外部事件后再全量刷新。")
 
@@ -1793,6 +1808,35 @@ def render_data_refresh_controls(
                 st.warning("缓存已清空。")
         else:
             st.warning("请先勾选确认项，避免误清空缓存。")
+
+
+def render_admin_login() -> bool:
+    password = os.getenv("DASHBOARD_ADMIN_PASSWORD", "")
+    if not password:
+        try:
+            password = str(st.secrets.get("DASHBOARD_ADMIN_PASSWORD", "") or "")
+        except FileNotFoundError:
+            pass
+    if not password:
+        st.caption("管理操作需要部署管理员配置口令。")
+        return False
+
+    expected = hashlib.sha256(password.encode()).digest()
+    if hmac.compare_digest(st.session_state.get("admin_login_digest", b""), expected):
+        if st.button("退出管理模式"):
+            st.session_state.pop("admin_login_digest", None)
+            st.session_state.pop("digest_requested", None)
+            st.rerun()
+        return True
+
+    with st.form("admin_login", clear_on_submit=True):
+        entered = st.text_input("管理员口令", type="password")
+        if st.form_submit_button("登录"):
+            if hmac.compare_digest(hashlib.sha256(entered.encode()).digest(), expected):
+                st.session_state.admin_login_digest = expected
+                st.rerun()
+            st.error("管理员口令不正确。")
+    return False
 
 
 def main() -> None:
@@ -1876,20 +1920,25 @@ def main() -> None:
     if llm_notice:
         st.sidebar.caption(llm_notice)
     with st.sidebar.expander("数据管理与高级设置", expanded=False):
-        keyword_tab, event_tab, data_tab = st.tabs(["关键词管理", "外部事件", "数据刷新"])
-        with keyword_tab:
-            render_sector_config_manager(sectors_config)
-        with event_tab:
-            render_event_config_manager(external_events, event_to_sectors, sectors_config)
-        with data_tab:
-            render_data_refresh_controls(
-                selected_sectors,
-                sectors_config,
-                external_events,
-                event_to_sectors,
-                llm_verifier,
-                show_external_events,
-            )
+        if st.button("重新加载缓存"):
+            st.session_state.cache_version += 1
+        st.caption("可立即读取后台更新的缓存。")
+        admin = render_admin_login()
+        if admin:
+            keyword_tab, event_tab, data_tab = st.tabs(["关键词管理", "外部事件", "数据刷新"])
+            with keyword_tab:
+                render_sector_config_manager(sectors_config)
+            with event_tab:
+                render_event_config_manager(external_events, event_to_sectors, sectors_config)
+            with data_tab:
+                render_data_refresh_controls(
+                    selected_sectors,
+                    sectors_config,
+                    external_events,
+                    event_to_sectors,
+                    llm_verifier,
+                    show_external_events,
+                )
 
     if show_sector_news and not selected_sectors and not show_external_events:
         st.info("请至少选择一个板块。")
@@ -1907,8 +1956,6 @@ def main() -> None:
         get_cache_fingerprint(st.session_state.cache_version),
         sectors_config,
         external_events,
-        llm_verifier_cache_key(llm_verifier),
-        llm_verifier,
     )
     if cache_error:
         st.warning(cache_error + "。页面将显示空缓存，可点击全量刷新重建。")
@@ -2006,14 +2053,16 @@ def main() -> None:
     )
 
     if raw_cache_display_df.empty:
-        st.info("缓存暂无新闻。后台任务会定时抓取，也可以在“数据管理与高级设置”中手动刷新。")
+        st.info("缓存暂无新闻。后台任务会定时抓取，管理员也可手动刷新。")
     elif sector_cache_display_df.empty and external_display_df.empty:
         st.info("当前时间范围下暂无新闻。可以尝试扩大时间范围或选择更多板块。")
 
     show_hot_news_section(hot_df, hot_used_fallback)
 
     if show_sector_news:
-        render_daily_digest_section(llm_verifier, selected_sectors, sector_deduped_df)
+        render_daily_digest_section(
+            llm_verifier, selected_sectors, sector_deduped_df, can_generate=admin
+        )
 
     if show_sector_news:
         if not selected_sectors:

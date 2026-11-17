@@ -1,0 +1,8 @@
+# Minimum versions verified against the PyPI advisories for the installed dependency set.
+brotli>=1.2.1
+certifi>=2026.10.23
+GitPython>=3.2.1
+pillow>=13.0.0
+soupsieve>=4.1.1
+urllib3>=2.8.0
+uvicorn>=0.52.0

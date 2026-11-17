@@ -5,6 +5,7 @@ import json
 
 from agent.compare_report import (
     SectorCompare,
+    compare,
     diff_kept,
     load_agent_trace,
     render_markdown,
@@ -68,11 +69,11 @@ def test_render_markdown_contains_table_and_totals():
         agent_kept=[{"title": "甲", "link": "l1"}, {"title": "乙", "link": "l2"}],
         rules_kept=[{"title": "乙", "link": "l2"}, {"title": "丙", "link": "l3"}],
         both=["l2"], agent_only=["l1"], rules_only=["l3"],
-        tool_calls=5,
+        tool_calls=5, llm_calls=7,
     )
     md = render_markdown("2026-11-16", [row])
-    assert "| 半导体芯片 | 2 | 2 | 1 | 1 | 1 | 否 | 5 |" in md
-    assert "LLM 调用合计：5 次" in md
+    assert "| 半导体芯片 | 2 | 2 | 1 | 1 | 1 | 否 | 5 | 7 |" in md
+    assert "决策模型调用合计：7 次" in md
     assert "仅 Agent 保留" in md and "l1" in md
     assert "仅规则保留" in md and "l3" in md
 
@@ -81,3 +82,22 @@ def test_render_markdown_skips_detail_when_no_diff():
     row = SectorCompare(sector="人工智能", both=["l1"])
     md = render_markdown("2026-11-16", [row])
     assert "差异明细" not in md
+
+
+def test_compare_uses_pre_rank_snapshot_and_skips_legacy_trace(tmp_path):
+    trace = tmp_path / "trace.jsonl"
+    full = [{"title": f"新闻{i}", "link": f"https://test/{i}"} for i in range(12)]
+    records = [
+        {"sector": "人工智能", "candidate_items": full, "agent_selected": full,
+         "rules_selected": full[:11], "kept_items": full[:10], "llm_calls": 3},
+        {"sector": "半导体芯片", "kept_items": full[:10]},
+    ]
+    trace.write_text("\n".join(
+        json.dumps({"date": "2026-11-16", **row}) for row in records
+    ), encoding="utf-8")
+    current, legacy = compare("2026-11-16", str(trace), ["人工智能", "半导体芯片"])
+    assert len(current.agent_kept) == 12
+    assert len(current.both) == 11 and current.agent_only == ["https://test/11"]
+    assert current.summary()["agent_only_items"] == [full[11]]
+    assert not legacy.summary()["comparable"]
+    assert "缺少同批候选快照" in render_markdown("2026-11-16", [legacy])

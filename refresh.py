@@ -18,7 +18,7 @@ from news_store import (
     read_cache,
     refilter_external_event_cache,
 )
-from time_utils import utc_now_iso
+from time_utils import UTC8, now_utc8_naive, utc_now_iso
 
 
 # 板块/事件类别层面的抓取并发数；每个板块内部的关键词还有一层并发，
@@ -34,6 +34,7 @@ class RefreshOutcome:
     event_warnings: dict[str, list[str]] = field(default_factory=dict)
     fetch_failed: bool = False
     read_error: str | None = None
+    base_cache: pd.DataFrame | None = None
 
 
 def fetch_selected_sector_cache(
@@ -183,6 +184,11 @@ def run_incremental_refresh(
         sectors_config=sectors_config,
         llm_verifier=llm_verifier,
     )
+    if any("重过滤失败" in warning for warning in cache_refilter_warnings):
+        return RefreshOutcome(
+            cache=existing_result.data, read_error="旧缓存重过滤失败",
+            event_warnings={"缓存重过滤": list(cache_refilter_warnings)},
+        )
     fetched_cache, warnings_by_sector, warnings_by_event = fetch_refresh_cache(
         selected_sectors,
         sectors_config,
@@ -198,6 +204,12 @@ def run_incremental_refresh(
         sectors_config=sectors_config,
         llm_verifier=llm_verifier,
     )
+    if any("重过滤失败" in warning for warning in merge_refilter_warnings):
+        return RefreshOutcome(
+            cache=existing_result.data, read_error="合并缓存重过滤失败",
+            sector_warnings=warnings_by_sector,
+            event_warnings={**warnings_by_event, "缓存重过滤": list(merge_refilter_warnings)},
+        )
     added_count = max(len(merged_cache) - len(existing_cache), 0)
     cache_warnings = [*cache_refilter_warnings, *merge_refilter_warnings]
     if cache_warnings:
@@ -208,6 +220,7 @@ def run_incremental_refresh(
         added_count=added_count,
         sector_warnings=warnings_by_sector,
         event_warnings=warnings_by_event,
+        base_cache=existing_result.data,
     )
 
 
@@ -217,6 +230,8 @@ def run_full_refresh(
     external_events: dict[str, list[Any]],
     event_to_sectors: dict[str, list[str]],
     llm_verifier: LLMVerifier | None = None,
+    *,
+    preserve_unselected: bool = False,
 ) -> RefreshOutcome:
     fetched_cache, warnings_by_sector, warnings_by_event = fetch_refresh_cache(
         selected_sectors,
@@ -225,7 +240,7 @@ def run_full_refresh(
         event_to_sectors,
         llm_verifier=llm_verifier,
     )
-    if fetched_cache.empty and (warnings_by_sector or warnings_by_event):
+    if fetched_cache.empty:
         return RefreshOutcome(
             cache=fetched_cache,
             sector_warnings=warnings_by_sector,
@@ -242,12 +257,31 @@ def run_full_refresh(
     )
     if cache_refilter_warnings:
         warnings_by_event.setdefault("缓存重过滤", []).extend(cache_refilter_warnings)
+    if rebuilt_cache.empty or any("重过滤失败" in warning for warning in cache_refilter_warnings):
+        return RefreshOutcome(
+            cache=rebuilt_cache, sector_warnings=warnings_by_sector,
+            event_warnings=warnings_by_event, fetch_failed=True,
+        )
+
+    existing = read_cache()
+    if existing.error:
+        return RefreshOutcome(cache=existing.data, read_error=existing.error)
+
+    sector_keep = existing.data["sector"].isin(warnings_by_sector)
+    event_keep = existing.data["event_category"].isin(warnings_by_event)
+    if preserve_unselected:
+        sector_keep |= ~existing.data["sector"].isin(selected_sectors)
+        event_keep |= ~existing.data["event_category"].isin(external_events)
+    external_mask = existing.data["news_type"].eq("external_event")
+    retained = existing.data[(external_mask & event_keep) | (~external_mask & sector_keep)]
+    combined, _ = merge_cache(retained, rebuilt_cache)
 
     return RefreshOutcome(
-        cache=rebuilt_cache,
+        cache=combined,
         added_count=len(rebuilt_cache),
         sector_warnings=warnings_by_sector,
         event_warnings=warnings_by_event,
+        base_cache=existing.data,
     )
 
 
@@ -259,11 +293,11 @@ def prune_old_cache(cache_df: pd.DataFrame, retention_days: int) -> pd.DataFrame
     if retention_days <= 0 or cache_df.empty:
         return cache_df
 
-    cutoff = pd.Timestamp.now() - pd.Timedelta(days=retention_days)
+    cutoff = pd.Timestamp(now_utc8_naive()) - pd.Timedelta(days=retention_days)
     publish_times = pd.to_datetime(cache_df["publish_time"], errors="coerce")
     fetched_times = pd.to_datetime(
         cache_df["fetched_at"], errors="coerce", utc=True
-    ).dt.tz_convert(None)
+    ).dt.tz_convert(UTC8).dt.tz_localize(None)
 
     keep_mask = (
         publish_times.ge(cutoff)

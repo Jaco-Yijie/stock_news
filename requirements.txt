@@ -1,5 +1,6 @@
+-c constraints.txt
 akshare
 pandas
 requests
-streamlit
+streamlit>=1.67.0
 pydantic>=2
