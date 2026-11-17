@@ -109,7 +109,7 @@ def inject_styles() -> None:
             --ink: #23201c;
             --ink-soft: #4c463f;
             --muted: #6e675e;
-            --faint: #9b938a;
+            --faint: #746c63;
             --red: #b5372e;
             --red-deep: #96291f;
             --red-soft: #f7ebe8;
@@ -269,13 +269,15 @@ def inject_styles() -> None:
             padding: 0.2rem 0 0.7rem;
         }
 
-        .masthead-title {
+        .masthead .masthead-title {
             font-family: var(--serif);
             font-size: 30px;
             font-weight: 900;
             letter-spacing: 0.06em;
             line-height: 1.2;
             color: var(--ink);
+            margin: 0;
+            padding: 0;
         }
 
         .masthead-date {
@@ -286,18 +288,17 @@ def inject_styles() -> None:
         }
 
         .ticker-strip {
-            display: flex;
-            flex-wrap: wrap;
-            align-items: baseline;
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
             border-top: 1px solid var(--line);
-            padding: 0.6rem 0 0.7rem;
+            padding: 0.8rem 0;
         }
 
         .ticker-strip .stat {
-            display: inline-flex;
-            align-items: baseline;
-            gap: 0.45rem;
-            padding: 0 1.15rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            padding: 0 0.9rem;
             border-right: 1px solid var(--line);
         }
 
@@ -316,7 +317,7 @@ def inject_styles() -> None:
         }
 
         .stat-num {
-            font-size: 1.18rem;
+            font-size: clamp(1.25rem, 3vw, 1.8rem);
             font-weight: 700;
             color: var(--ink);
             font-variant-numeric: tabular-nums;
@@ -344,14 +345,15 @@ def inject_styles() -> None:
             border-bottom: 1px solid var(--line);
         }
 
-        .sector-name {
+        .sector-heading .sector-name {
             font-family: var(--serif);
             color: var(--ink);
             font-size: 19px;
             font-weight: 700;
             overflow-wrap: anywhere;
             border-left: 3px solid var(--red);
-            padding-left: 10px;
+            padding: 0 0 0 10px;
+            margin: 0;
             line-height: 1.3;
         }
 
@@ -409,18 +411,15 @@ def inject_styles() -> None:
             background: #fbfaf7;
         }
 
-        .news-title {
+        .news-card .news-title {
             margin: 0 0 6px;
+            padding: 0;
             color: var(--ink);
             font-size: 17px;
             line-height: 1.5;
             font-weight: 600;
             overflow-wrap: anywhere;
             word-break: break-word;
-            display: -webkit-box;
-            -webkit-line-clamp: 3;
-            -webkit-box-orient: vertical;
-            overflow: hidden;
         }
 
         .news-meta {
@@ -533,14 +532,23 @@ def inject_styles() -> None:
             color: var(--ink-soft);
             font-size: 13px;
             margin-top: 7px;
+            overflow-wrap: anywhere;
         }
 
-        .section-title {
-            font-family: var(--serif);
-            font-size: 20px;
+        .st-key-news_navigation [role="tab"] {
+            min-height: 2.75rem;
+            padding-inline: 0.75rem;
+            color: var(--muted);
+        }
+
+        .st-key-news_navigation [role="tab"][aria-selected="true"] {
+            color: var(--red-deep);
             font-weight: 700;
-            color: var(--ink);
-            margin: 1.2rem 0 0.15rem;
+        }
+
+        .st-key-news_navigation [role="tab"]:focus-visible {
+            outline: 2px solid var(--red);
+            outline-offset: -3px;
         }
 
         .hot-card {
@@ -552,11 +560,12 @@ def inject_styles() -> None:
             margin-bottom: 0.6rem;
         }
 
-        .hot-title {
+        .hot-card .hot-title {
             font-size: 18px;
             font-weight: 650;
             color: var(--ink);
             margin: 6px 0 4px;
+            padding: 0;
             line-height: 1.45;
             overflow-wrap: anywhere;
         }
@@ -568,14 +577,10 @@ def inject_styles() -> None:
         }
 
         /* ---- 侧边栏结构：眉题分组 + 轻量操作 + 扁平分组列表 ---- */
-        [data-testid="stSidebar"] .side-label {
+        [data-testid="stSidebar"] h3.side-label {
             border-top: 1px solid var(--line);
-            margin-top: 1.15rem;
-            padding-top: 0.95rem;
-            font-size: 12px;
-            font-weight: 700;
-            letter-spacing: 0.16em;
-            color: var(--faint);
+            margin: 0.35rem 0 0;
+            padding: 0.85rem 0 0;
         }
 
         [data-testid="stSidebar"] .sector-status {
@@ -674,23 +679,19 @@ def inject_styles() -> None:
                 max-width: 300px !important;
             }
 
-            .masthead-title {
+            .masthead .masthead-title {
                 font-size: 24px;
             }
 
-            .ticker-strip {
-                gap: 0.3rem 0;
+            .ticker-strip .stat {
+                padding-inline: 0.35rem;
             }
 
             .stat-label {
                 font-size: 11px;
             }
 
-            .stat-num {
-                font-size: 1rem;
-            }
-
-            .hot-title {
+            .hot-card .hot-title {
                 font-size: 16px;
             }
 
@@ -703,7 +704,7 @@ def inject_styles() -> None:
                 gap: 8px;
             }
 
-            .sector-name {
+            .sector-heading .sector-name {
                 font-size: 17px;
             }
 
@@ -716,10 +717,9 @@ def inject_styles() -> None:
                 padding: 12px;
             }
 
-            .news-title {
+            .news-card .news-title {
                 font-size: 15px;
                 line-height: 1.5;
-                -webkit-line-clamp: 3;
             }
 
             .news-meta {
@@ -1144,7 +1144,7 @@ def render_news_item(
 
     return f"""
         <article class="news-card">
-            <div class="news-title">{title}</div>
+            <h4 class="news-title">{title}</h4>
             {news_tags_html(row, hot_links)}
             <div class="news-meta">
                 <span>{source}</span>
@@ -1176,7 +1176,7 @@ def render_external_event_item(
 
     return f"""
         <article class="news-card">
-            <div class="news-title">{title}</div>
+            <h4 class="news-title">{title}</h4>
             {news_tags_html(row, hot_links)}
             <div class="news-meta">
                 <span>{source}</span>
@@ -1216,7 +1216,7 @@ def render_hot_news_item(row: pd.Series) -> str:
     return f"""
         <article class="hot-card">
             <div class="news-tags">{tags}</div>
-            <div class="hot-title">{title}</div>
+            <h3 class="hot-title">{title}</h3>
             <div class="news-meta">
                 <span>来源：{source}</span>
                 <span>{publish_time}</span>
@@ -1326,9 +1326,11 @@ def render_daily_digest_section(
             st.caption(f"已选板块较多，仅生成前 {MAX_DIGEST_SECTORS} 个板块的日报以控制成本。")
 
 
-def show_hot_news_section(hot_df: pd.DataFrame, used_fallback: bool) -> None:
-    st.markdown('<div class="section-title">今日重点新闻</div>', unsafe_allow_html=True)
-    st.caption("范围：全部板块与相关外部事件，与关注板块相关的新闻优先。")
+def show_hot_news_section(
+    hot_df: pd.DataFrame, used_fallback: bool, scope_label: str
+) -> None:
+    st.subheader("今日重点新闻")
+    st.caption(f"从{scope_label}中选取重点新闻，优先展示与关注板块相关的报道。")
     if hot_df is None or hot_df.empty:
         st.info("今日暂无足够重要的新闻。可以尝试刷新数据或选择更多板块。")
         return
@@ -1398,7 +1400,7 @@ def show_sector_section(
         f"""
         <section class="sector-section">
             <div class="sector-heading">
-                <div class="sector-name">{escape(sector)}相关新闻</div>
+                <h3 class="sector-name">{escape(sector)}</h3>
                 <div class="sector-meta">
                     <span class="pill">共 {len(filtered_df)} 条</span>
                     {sentiment_pills}
@@ -1457,7 +1459,7 @@ def show_external_events_section(
         f"""
         <section class="sector-section">
             <div class="sector-heading">
-                <div class="sector-name">外部宏观风险事件</div>
+                <h3 class="sector-name">外部宏观风险事件</h3>
                 <div class="sector-meta">
                     <span class="pill">共 {len(filtered_df)} 条</span>
                     {sentiment_pills}
@@ -1482,7 +1484,7 @@ def render_dashboard_header(
     )
     stats = [
         ("今日新闻", today_total, ""),
-        ("今日热点", hot_count, ""),
+        ("重点新闻", hot_count, ""),
         ("利好", today_counts.get("positive", 0), "up"),
         ("中性", today_counts.get("neutral", 0), ""),
         ("利空", today_counts.get("negative", 0), "down"),
@@ -1500,7 +1502,7 @@ def render_dashboard_header(
         f"""
         <section class="masthead">
             <div class="masthead-top">
-                <div class="masthead-title">板块新闻</div>
+                <h1 class="masthead-title">板块新闻</h1>
                 <div class="masthead-date">{escape(date_text)}</div>
             </div>
             <div class="ticker-strip">{stats_html}</div>
@@ -1872,24 +1874,7 @@ def main() -> None:
     if events_config_error:
         st.sidebar.warning(events_config_error)
 
-    st.sidebar.markdown('<div class="side-label">关注板块</div>', unsafe_allow_html=True)
-    sector_query = st.sidebar.text_input(
-        "板块搜索",
-        placeholder="搜索板块或关键词",
-        key="sector_query",
-        label_visibility="collapsed",
-    )
-    render_sector_selector(sectors_config, sector_query)
-
-    selected_sectors = [
-        sector
-        for sector in sectors_config
-        if st.session_state.get(f"sector_selected::{sector}", False)
-    ]
-    if selected_sectors:
-        st.sidebar.caption("已选：" + "、".join(selected_sectors))
-
-    st.sidebar.markdown('<div class="side-label">新闻列表</div>', unsafe_allow_html=True)
+    st.sidebar.markdown('<h3 class="side-label">新闻范围</h3>', unsafe_allow_html=True)
     display_scope = st.sidebar.radio(
         "新闻类型",
         options=["全部", "板块新闻", "外部事件"],
@@ -1902,14 +1887,28 @@ def main() -> None:
         "时间范围", options=TIME_RANGE_OPTIONS, key="time_range", horizontal=True
     )
     keyword = st.sidebar.text_input(
-        "关键词搜索", placeholder="标题、命中关键词、来源媒体", key="keyword_search"
+        "关键词搜索", placeholder="标题、匹配关键词或来源…", key="keyword_search"
     )
     # 占位容器：来源媒体选项依赖缓存数据，数据加载后再填充，
     # 但视觉位置保持在关键词搜索之后、展示条数之前
     source_filter_container = st.sidebar.container()
     max_items = st.sidebar.slider(
-        "每个板块最多展示条数", min_value=5, max_value=100, key="max_items"
+        "每组最多展示条数", min_value=5, max_value=100, key="max_items"
     )
+
+    st.sidebar.markdown('<h3 class="side-label">关注板块</h3>', unsafe_allow_html=True)
+    sector_query = st.sidebar.text_input(
+        "板块搜索",
+        placeholder="搜索板块或关键词…",
+        key="sector_query",
+        label_visibility="collapsed",
+    )
+    render_sector_selector(sectors_config, sector_query)
+    selected_sectors = [
+        sector
+        for sector in sectors_config
+        if st.session_state.get(f"sector_selected::{sector}", False)
+    ]
 
     st.sidebar.divider()
     # 重置放底部：先看筛选项，逃生舱最后；用回调避免在组件实例化后改状态
@@ -1940,10 +1939,6 @@ def main() -> None:
                     show_external_events,
                 )
 
-    if show_sector_news and not selected_sectors and not show_external_events:
-        st.info("请至少选择一个板块。")
-        return
-
     (
         raw_cache_display_df,
         sector_deduped_df,
@@ -1958,7 +1953,7 @@ def main() -> None:
         external_events,
     )
     if cache_error:
-        st.warning(cache_error + "。页面将显示空缓存，可点击全量刷新重建。")
+        st.warning(cache_error + "。页面将显示空缓存，管理员可在数据设置中全量刷新。")
     # 常规的"已按新规则过滤旧缓存"属于后台正常行为，不展示；只提示真正的失败
     refilter_failures = [
         warning for warning in cache_refilter_warnings if "失败" in warning
@@ -1995,7 +1990,6 @@ def main() -> None:
             key="source_filter",
             placeholder="选择来源媒体",
         )
-        st.caption(f"缓存共 {int(metadata['total'])} 条新闻")
 
     results: dict[str, SectorResult] = {}
     warnings_by_sector = st.session_state.get("last_sector_warnings", {})
@@ -2052,40 +2046,53 @@ def main() -> None:
         "利好 / 利空 / 影响等级由规则与新闻文本自动生成，仅供信息参考，不构成投资建议。"
     )
 
-    if raw_cache_display_df.empty:
-        st.info("缓存暂无新闻。后台任务会定时抓取，管理员也可手动刷新。")
-    elif sector_cache_display_df.empty and external_display_df.empty:
-        st.info("当前时间范围下暂无新闻。可以尝试扩大时间范围或选择更多板块。")
+    tab_labels = ["市场概览"]
+    if show_sector_news:
+        tab_labels.append("板块新闻")
+    if show_external_events:
+        tab_labels.append("外部事件")
+    tabs = dict(zip(tab_labels, st.tabs(tab_labels, key="news_navigation")))
 
-    show_hot_news_section(hot_df, hot_used_fallback)
+    with tabs["市场概览"]:
+        scope_label = "板块新闻和外部事件" if display_scope == "全部" else display_scope
+        st.caption(f"新闻类型：{scope_label} · 缓存共 {int(metadata['total'])} 条")
+        if raw_cache_display_df.empty:
+            st.info("缓存暂无新闻。后台任务会定时抓取，管理员也可手动刷新。")
+        else:
+            show_hot_news_section(hot_df, hot_used_fallback, scope_label)
+        if show_sector_news:
+            render_daily_digest_section(
+                llm_verifier, selected_sectors, sector_deduped_df, can_generate=admin
+            )
 
     if show_sector_news:
-        render_daily_digest_section(
-            llm_verifier, selected_sectors, sector_deduped_df, can_generate=admin
-        )
+        with tabs["板块新闻"]:
+            st.subheader("板块新闻")
+            st.caption(f"已选 {len(selected_sectors)} 个板块 · 时间范围：{time_range}")
+            if not selected_sectors:
+                st.info("在侧栏的「关注板块」中选择至少一个板块。")
+            for sector in selected_sectors:
+                show_sector_section(
+                    sector,
+                    results[sector],
+                    keyword,
+                    selected_sources,
+                    max_items,
+                    hot_links,
+                )
 
-    if show_sector_news:
-        if not selected_sectors:
-            st.info("未选择板块，当前只显示外部事件。")
-        for sector in selected_sectors:
-            show_sector_section(
-                sector,
-                results[sector],
+    if show_external_events:
+        with tabs["外部事件"]:
+            st.subheader("外部事件")
+            st.caption(f"时间范围：{time_range}")
+            show_external_events_section(
+                external_display_df,
+                st.session_state.get("last_external_warnings", {}),
                 keyword,
                 selected_sources,
                 max_items,
                 hot_links,
             )
-
-    if show_external_events:
-        show_external_events_section(
-            external_display_df,
-            st.session_state.get("last_external_warnings", {}),
-            keyword,
-            selected_sources,
-            max_items,
-            hot_links,
-        )
 
 
 if __name__ == "__main__":

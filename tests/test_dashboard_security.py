@@ -24,6 +24,27 @@ def test_accepts_https_links_with_normal_query_values():
     assert safe_news_url(url) == url
 
 
+def test_dashboard_tabs_follow_news_scope_and_keep_empty_state(monkeypatch):
+    monkeypatch.setattr(config_store, "_get_config_store", lambda: None)
+    monkeypatch.setattr(news_store, "get_supabase_store", lambda: None)
+    monkeypatch.setattr(llm_provider, "load_llm_verifier_from_env", lambda: (None, None))
+    app = AppTest.from_file(BASE_DIR / "main.py").run()
+
+    assert not app.exception
+    assert [tab.label for tab in app.tabs] == ["市场概览", "板块新闻", "外部事件"]
+    scope = next(radio for radio in app.sidebar.radio if radio.label == "新闻类型")
+    scope.set_value("外部事件").run()
+    assert not app.exception
+    assert [tab.label for tab in app.tabs] == ["市场概览", "外部事件"]
+
+    scope = next(radio for radio in app.sidebar.radio if radio.label == "新闻类型")
+    scope.set_value("板块新闻").run()
+    app.button(key="clear_all_sectors").click().run()
+    assert not app.exception
+    assert [tab.label for tab in app.tabs] == ["市场概览", "板块新闻"]
+    assert any("选择至少一个板块" in message.value for message in app.tabs[1].info)
+
+
 def test_dashboard_writes_require_admin_and_logout_revokes_access(monkeypatch):
     monkeypatch.setattr(config_store, "_get_config_store", lambda: None)
     monkeypatch.setattr(news_store, "get_supabase_store", lambda: None)
