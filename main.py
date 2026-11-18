@@ -157,6 +157,7 @@ def inject_styles() -> None:
         .briefing ul { margin: 0; padding-left: 1.2rem; color: var(--muted); }
         .briefing li + li { margin-top: .3rem; }
         .briefing li { overflow-wrap: anywhere; font-size: .9rem; }
+        .briefing-more { display: none; }
 
         .st-key-market_mood, .st-key-follow_panel, .st-key-heat_panel {
             background: var(--surface);
@@ -166,6 +167,7 @@ def inject_styles() -> None:
         .market-totals dl { display: flex; flex-wrap: wrap; gap: .5rem 1.6rem; margin: .85rem 0; }
         .market-totals dt { color: var(--muted); font-size: .82rem; }
         .market-totals dd { margin: 0; color: var(--brand); font-size: 1.6rem; line-height: 1.25; }
+        .market-scope { color: var(--muted); font-size: .75rem; font-weight: 400; }
         .mood-bar { display: flex; height: .55rem; border-radius: .3rem; overflow: hidden; background: var(--neutral-soft); }
         .market-totals .mood-bar { margin-bottom: .65rem; }
         .mood-bar > span { flex: var(--count) 1 0; background: var(--mood); min-width: 0; }
@@ -267,22 +269,74 @@ def inject_styles() -> None:
         .related-item { padding: .3rem .65rem 0; }
 
         @media (max-width: 860px) {
-            :is(.st-key-overview_top, .st-key-overview_body, .st-key-main_filters) [data-testid="stHorizontalBlock"] {
+            :is(.st-key-overview_top, .st-key-overview_body) [data-testid="stHorizontalBlock"] {
                 flex-wrap: wrap;
+                row-gap: .65rem;
             }
-            :is(.st-key-overview_top, .st-key-overview_body, .st-key-main_filters) [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+            :is(.st-key-overview_top, .st-key-overview_body) [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
                 flex: 1 1 100%;
                 width: 100%;
             }
-            .st-key-market_mood [data-testid="stHorizontalBlock"] { flex-wrap: nowrap; }
-            .st-key-market_mood [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
-                flex: 1 1 0;
-                width: auto;
+            :is(.st-key-main_filters, .st-key-market_mood) [data-testid="stHorizontalBlock"] {
+                flex-wrap: nowrap;
+                gap: .5rem;
+            }
+            :is(.st-key-main_filters, .st-key-market_mood) [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
                 min-width: 0 !important;
             }
+            .st-key-main_filters [data-testid="stColumn"]:first-child { flex: 1 1 0; }
+            .st-key-main_filters [data-testid="stColumn"]:last-child { flex: 2 1 0; }
+            .st-key-market_mood [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] { flex: 1 1 0; }
+            .st-key-market_mood [data-testid="stVerticalBlock"] { gap: .4rem; }
+            .st-key-news_navigation { margin-top: -.4rem; }
+            .st-key-news_navigation [role="tab"] { min-height: 2.5rem; }
+
+            .masthead { margin-bottom: .35rem; padding-bottom: .4rem; gap: .3rem .65rem; }
+            .masthead-date { font-size: .75rem; }
+            .briefing {
+                position: relative;
+                height: auto;
+                padding: .55rem .8rem .65rem;
+            }
+            .briefing:has(> .briefing-more) .briefing-label {
+                display: flex;
+                align-items: center;
+                min-height: 2.25rem;
+                padding-inline-end: 6rem;
+            }
+            .briefing .briefing-headline { font-size: 1.15rem; margin: .22rem 0 0; }
+            .briefing-points { display: none; }
+            .briefing-more {
+                display: block;
+                color: var(--brand);
+            }
+            .briefing-more[open] {
+                margin-top: .2rem;
+                padding-top: .35rem;
+            }
+            .briefing-more summary {
+                position: absolute;
+                inset: .55rem .8rem auto auto;
+                min-height: 2.25rem;
+                line-height: 2.25rem;
+                cursor: pointer;
+                font-size: .82rem;
+            }
+            .briefing-more summary:hover { text-decoration: underline; }
+            .briefing-more ul { margin-bottom: .3rem; }
+
+            .market-totals { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .7rem; }
+            .market-totals h3 { font-size: .82rem; }
+            .market-totals dl { gap: .3rem .65rem; margin: 0; }
+            .market-totals dt { font-size: .75rem; }
+            .market-totals dl > div { display: flex; align-items: baseline; gap: .3rem; }
+            .market-totals dd { font-size: .95rem; }
+            .market-totals .mood-bar { flex-basis: 100%; height: .35rem; margin-bottom: 0; }
+            .st-key-overview_body { margin-top: 0; }
+            .st-key-overview_flow h3 { font-size: 1.18rem; padding-block: .15rem 0; }
         }
         @media (max-width: 600px) {
-            .block-container { padding: 3.5rem .85rem 2rem; }
+            .block-container { padding: 3rem .85rem 2rem; }
             .news-card { padding: .7rem .75rem; }
         }
         </style>
@@ -868,12 +922,17 @@ def render_market_brief(today: pd.DataFrame, hot_today: pd.DataFrame) -> None:
     else:
         points.append("后台会定时更新新闻，也可以在下方查看已有报道。")
     bullets = "".join(f"<li>{escape(point)}</li>" for point in points)
+    points_html = (
+        f'<ul class="briefing-points">{bullets}</ul>'
+        f'<details class="briefing-more"><summary>展开要点</summary><ul>{bullets}</ul></details>'
+        if bullets else ""
+    )
     st.markdown(
         f"""
         <section class="briefing">
             <h2 class="briefing-label">今日速览</h2>
             <p class="briefing-headline">{escape(headline)}</p>
-            <ul>{bullets}</ul>
+            {points_html}
         </section>
         """,
         unsafe_allow_html=True,
@@ -884,16 +943,17 @@ def toggle_overview_filter(key: str, value: str) -> None:
     st.session_state[key] = "" if st.session_state.get(key) == value else value
 
 
-def render_market_mood(today: pd.DataFrame, hot_count: int) -> None:
+def render_market_mood(today: pd.DataFrame, hot_count: int, *, followed_only: bool) -> None:
     counts = sentiment_counts(today["analysis"]) if not today.empty else dict.fromkeys(SENTIMENT_LABELS, 0)
     segments = "".join(
         f'<span class="mood-{sentiment}" style="--count:{counts[sentiment]}"></span>'
         for sentiment in SENTIMENT_LABELS if counts[sentiment]
     )
+    scope = '<small class="market-scope"> · 关注板块</small>' if followed_only else ""
     st.markdown(
         f"""
         <section class="market-totals">
-            <h3>情绪分布</h3>
+            <h3>情绪分布{scope}</h3>
             <dl><div><dt>今日新闻</dt><dd><strong>{len(today)}</strong></dd></div>
                 <div><dt>今日重点</dt><dd><strong>{hot_count}</strong></dd></div></dl>
             <div class="mood-bar" aria-hidden="true">{segments}</div>
@@ -1223,16 +1283,16 @@ def render_sector_selector(sectors_config: dict[str, Any]) -> list[str]:
         "followed_sectors", [sector for sector in DEFAULT_SELECTED_SECTORS if sector in sectors_config]
     )
     st.session_state.followed_sectors = [sector for sector in current if sector in sectors_config]
-    selected = st.multiselect(
-        "关注板块", options, key="followed_sectors", placeholder="搜索并选择板块",
-        on_change=clear_overview_sector,
-    )
-    st.caption(f"已关注 {len(selected)} / {len(options)} 个板块")
-    with st.container(horizontal=True, gap="small"):
-        st.button(
-            "全选", key="select_all_sectors", on_click=set_followed_sectors, args=(options,)
+    with st.popover(f"关注板块 · {len(st.session_state.followed_sectors)} 个", width="stretch"):
+        selected = st.multiselect(
+            "关注板块", options, key="followed_sectors", placeholder="搜索并选择板块",
+            on_change=clear_overview_sector,
         )
-        st.button("清空", key="clear_all_sectors", on_click=set_followed_sectors, args=([],))
+        with st.container(horizontal=True, gap="small"):
+            st.button(
+                "全选", key="select_all_sectors", on_click=set_followed_sectors, args=(options,)
+            )
+            st.button("清空", key="clear_all_sectors", on_click=set_followed_sectors, args=([],))
     return selected
 
 
@@ -1434,7 +1494,7 @@ def main() -> None:
             brief_col, mood_col = st.columns([2, 1])
         with st.container(key="overview_body"):
             follow_col, flow_col, heat_col = st.columns([1, 2.7, 1.2])
-        with follow_col.container(border=True, key="follow_panel"):
+        with follow_col.container(key="follow_panel"):
             selected_sectors = render_sector_selector(sectors_config)
         overview_footer = st.container()
 
@@ -1532,9 +1592,7 @@ def main() -> None:
     with brief_col:
         render_market_brief(followed_today, hot_today)
     with mood_col.container(border=True, key="market_mood"):
-        render_market_mood(followed_today, len(hot_today))
-        if selected_sectors:
-            st.caption("统计范围：关注板块")
+        render_market_mood(followed_today, len(hot_today), followed_only=bool(selected_sectors))
     with flow_col.container(key="overview_flow"):
         render_overview_flow(
             overview_pool, selected_sectors, time_range, keyword, selected_sources,
