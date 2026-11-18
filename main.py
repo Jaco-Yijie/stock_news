@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import os
+from collections import Counter
 from html import escape
 from typing import Any
 
@@ -31,6 +32,7 @@ from config_store import (
 from analysis import (
     IMPACT_LABELS,
     LOW_CONFIDENCE_REASON,
+    LOW_CONFIDENCE_THRESHOLD,
     SENTIMENT_LABELS,
     analyze_display_frame,
     group_similar_news,
@@ -38,6 +40,7 @@ from analysis import (
     select_hot_news,
     sentiment_counts,
     sort_news_by_importance,
+    target_sectors_for_row,
 )
 from analysis_rules import CATEGORY_LABELS
 from digest import build_digest_records, generate_sector_digest
@@ -58,36 +61,11 @@ from sectors import SECTORS as DEFAULT_SECTORS
 from time_utils import now_utc8_naive
 
 
-st.set_page_config(page_title="板块新闻", page_icon="📰", layout="wide")
+st.set_page_config(
+    page_title="板块新闻", page_icon="📰", layout="wide", initial_sidebar_state="collapsed"
+)
 DEFAULT_SELECTED_SECTORS = ("半导体芯片",)
 TIME_RANGE_OPTIONS = ("全部", "今天", "近 3 天", "本周")
-SECTOR_GROUPS: dict[str, tuple[str, ...]] = {
-    "科技": (
-        "半导体芯片",
-        "人工智能",
-        "算力数据中心",
-        "信创软件",
-        "网络安全",
-        "消费电子",
-        "量子计算",
-    ),
-    "新兴产业": ("商业航天", "低空经济", "机器人", "脑机接口"),
-    "新能源": ("新能源汽车", "光伏", "风电", "储能", "电力设备"),
-    "医药": ("创新药", "医药医疗", "CXO"),
-    "消费": ("白酒消费", "家电", "旅游酒店", "传媒游戏"),
-    "金融地产": ("银行", "证券", "保险", "房地产"),
-    "周期资源": (
-        "有色金属",
-        "黄金",
-        "煤炭",
-        "钢铁",
-        "化工",
-        "农业",
-        "航运港口",
-        "物流快递",
-        "环保水务",
-    ),
-}
 
 
 def get_llm_verifier() -> tuple[LLMVerifier | None, str | None]:
@@ -98,649 +76,214 @@ def inject_styles() -> None:
     st.markdown(
         """
         <style>
-        /* ============================================================
-           设计语言：中文财经日报
-           纸面灰白底 + 暖墨字 + 市场红（品牌色即"利好红"）+ 盘面绿
-           报头与栏目标题用宋体，数字一律等宽对齐（红涨绿跌）
-           ============================================================ */
         :root {
-            --paper: #f6f5f2;
-            --surface: #ffffff;
-            --surface-soft: #f1efeb;
-            --line: #e5e1d8;
-            --line-strong: #cfc9be;
+            --surface: #fff;
+            --soft: #f2f4f7;
+            --line: #e1ded6;
             --ink: #23201c;
-            --ink-soft: #4c463f;
-            --muted: #6e675e;
-            --faint: #746c63;
-            --red: #b5372e;
-            --red-deep: #96291f;
-            --red-soft: #f7ebe8;
-            --red-line: #e4c4bf;
-            --green: #2e7d4f;
-            --green-soft: #eaf2ec;
-            --green-line: #c4dbcc;
-            --amber: #96660f;
-            --amber-soft: #f7efdb;
-            --amber-line: #e6d3a8;
-            --serif: "Songti SC", "Noto Serif SC", "STSong", "SimSun", serif;
+            --muted: #625e57;
+            --brand: #1d3a5f;
+            --brand-soft: #e8eef5;
+            --positive: #a12634;
+            --positive-soft: #fbedef;
+            --neutral: #59616b;
+            --neutral-soft: #eef0f2;
+            --negative: #216246;
+            --negative-soft: #e9f3ed;
+            --serif: "Songti SC", STSong, SimSun, Georgia, serif;
+            --sans: system-ui, -apple-system, BlinkMacSystemFont, "PingFang SC",
+                    "Microsoft YaHei", sans-serif;
         }
-
-        .stApp {
-            background: var(--paper);
-            color: var(--ink);
-        }
-
-        header[data-testid="stHeader"] {
-            height: 1rem !important;
-            min-height: 1rem !important;
-            background: transparent !important;
-            z-index: 990 !important;
-        }
-
-        div[data-testid="stDecoration"] {
-            display: none !important;
-            height: 0 !important;
-        }
-
-        div[data-testid="stToolbar"] {
-            top: 0.25rem !important;
-            right: 0.75rem !important;
-            z-index: 991 !important;
-        }
-
-        section.main {
-            padding-top: 0 !important;
-        }
-
-        .block-container {
-            padding-top: 1rem !important;
-            padding-left: 2rem;
-            padding-right: 2rem;
-            padding-bottom: 3rem;
-            max-width: 1360px;
-        }
-
-        main .block-container {
-            padding-top: 1rem !important;
-        }
-
-        [data-testid="stSidebar"] {
-            background: #fbfaf7;
-            border-right: 1px solid var(--line);
-            min-width: 292px !important;
-            max-width: 320px !important;
-        }
-
-        [data-testid="stSidebar"] * {
-            color: var(--ink);
-            letter-spacing: 0;
-            font-size: 14px;
-        }
-
-        [data-testid="stSidebar"] h2,
-        [data-testid="stSidebar"] h3 {
-            font-family: var(--serif);
-            font-size: 1.02rem;
-            font-weight: 700;
-            color: var(--ink);
-            margin-bottom: 0.5rem;
-        }
-
-        [data-testid="stSidebar"] [data-baseweb="tag"] {
-            background-color: var(--red-soft);
-            border: 1px solid var(--red-line);
-            color: var(--red-deep);
-            font-weight: 600;
-        }
-
-        [data-testid="stSidebar"] [data-baseweb="tag"] span {
-            color: var(--red-deep);
-        }
-
-        [data-baseweb="select"] > div,
-        [data-baseweb="input"] > div {
-            background: var(--surface);
-            border-color: var(--line);
-            border-radius: 3px;
-            box-shadow: none;
-        }
-
-        [data-baseweb="select"] > div:hover,
-        [data-baseweb="input"] > div:hover {
-            border-color: var(--line-strong);
-        }
-
-        [data-testid="stSlider"] [role="slider"] {
-            background: var(--red);
-            border-color: var(--red);
-        }
-
-        [data-testid="stCheckbox"] {
-            min-height: 1.75rem;
-        }
-
-        [data-testid="stCheckbox"] label {
-            gap: 0.35rem;
-            color: var(--ink);
-            font-size: 0.9rem;
-        }
-
-        [data-testid="stCheckbox"] div[role="checkbox"] {
-            border-color: var(--line-strong) !important;
-        }
-
-        [data-testid="stCheckbox"] div[role="checkbox"][aria-checked="true"] {
-            background-color: var(--red) !important;
-            border-color: var(--red) !important;
-        }
-
-        div.stButton > button {
-            width: 100%;
-            border: 1px solid var(--line-strong);
-            border-radius: 3px;
-            background: var(--surface);
-            color: var(--ink);
-            box-shadow: none;
-            font-weight: 600;
-            transition: border-color 120ms ease, color 120ms ease;
-        }
-
-        div.stButton > button:hover {
-            border-color: var(--red);
-            background: var(--surface);
-            color: var(--red-deep);
-        }
-
-        div.stButton > button:focus-visible,
-        a:focus-visible {
-            outline: 2px solid var(--red);
+        .stApp { font-family: var(--sans); }
+        .block-container { max-width: 1480px; padding: 3.75rem 2rem 3rem; }
+        [data-testid="stSidebar"] { border-right: 1px solid var(--line); }
+        .stApp :is(button, a, summary, input, textarea, [tabindex]):focus-visible {
+            outline: 2px solid var(--brand);
             outline-offset: 2px;
         }
-
-        /* ---- 报头 ---- */
-        .masthead {
-            border-bottom: 4px double var(--line-strong);
-            margin-bottom: 1.1rem;
+        .stApp [data-baseweb="select"] > div:hover,
+        .stApp [data-baseweb="input"] > div:hover { border-color: var(--brand); }
+        .stApp [data-baseweb="select"] > div:focus-within,
+        .stApp [data-baseweb="input"] > div:focus-within {
+            box-shadow: 0 0 0 2px var(--brand);
         }
+        .stApp :is(summary, [role="tab"]):hover { color: var(--brand); }
 
-        .masthead-top {
+        .masthead {
             display: flex;
             justify-content: space-between;
             align-items: baseline;
-            gap: 1rem;
-            padding: 0.2rem 0 0.7rem;
+            gap: .5rem 1rem;
+            flex-wrap: wrap;
+            padding-bottom: .6rem;
+            margin-bottom: .8rem;
+            border-bottom: 3px double var(--brand);
         }
-
         .masthead .masthead-title {
-            font-family: var(--serif);
-            font-size: 30px;
-            font-weight: 900;
-            letter-spacing: 0.06em;
-            line-height: 1.2;
-            color: var(--ink);
             margin: 0;
             padding: 0;
+            color: var(--brand);
+            font: 800 clamp(1.45rem, 2.5vw, 2rem)/1.25 var(--serif);
         }
-
-        .masthead-date {
-            font-size: 13px;
-            color: var(--muted);
-            white-space: nowrap;
+        .masthead-date, .news-time, .market-totals strong {
             font-variant-numeric: tabular-nums;
         }
+        .masthead-date { color: var(--muted); font-size: .84rem; }
+        .st-key-news_navigation [role="tab"] { min-height: 2.75rem; }
+        .st-key-news_navigation [role="tab"]:focus-visible { outline-offset: -3px; }
+        .st-key-news_navigation [aria-selected="true"] { font-weight: 700; }
 
-        .ticker-strip {
-            display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
-            border-top: 1px solid var(--line);
-            padding: 0.8rem 0;
-        }
-
-        .ticker-strip .stat {
-            display: flex;
-            flex-direction: column;
-            gap: 0.35rem;
-            padding: 0 0.9rem;
-            border-right: 1px solid var(--line);
-        }
-
-        .ticker-strip .stat:first-child {
-            padding-left: 0;
-        }
-
-        .ticker-strip .stat:last-child {
-            border-right: 0;
-        }
-
-        .stat-label {
-            font-size: 0.78rem;
-            color: var(--muted);
-            white-space: nowrap;
-        }
-
-        .stat-num {
-            font-size: clamp(1.25rem, 3vw, 1.8rem);
-            font-weight: 700;
-            color: var(--ink);
-            font-variant-numeric: tabular-nums;
-            line-height: 1.2;
-        }
-
-        .stat-num.up { color: var(--red); }
-        .stat-num.down { color: var(--green); }
-
-        /* ---- 板块区块 ---- */
-        .sector-section {
+        .briefing {
+            height: 100%;
+            padding: clamp(1rem, 2.2vw, 1.9rem);
             background: var(--surface);
             border: 1px solid var(--line);
-            border-radius: 3px;
-            margin: 0.8rem 0 1rem;
-            overflow: hidden;
+            border-top: 4px solid var(--brand);
+            border-radius: .75rem;
         }
+        .briefing .briefing-label, .market-totals h3 {
+            margin: 0;
+            padding: 0;
+            color: var(--brand);
+            font: 750 .95rem/1.4 var(--sans);
+        }
+        .briefing .briefing-headline {
+            margin: .48rem 0 .75rem;
+            padding: 0;
+            color: var(--ink);
+            font: 800 clamp(1.4rem, 2.65vw, 2.25rem)/1.35 var(--serif);
+            overflow-wrap: anywhere;
+        }
+        .briefing ul { margin: 0; padding-left: 1.2rem; color: var(--muted); }
+        .briefing li + li { margin-top: .3rem; }
+        .briefing li { overflow-wrap: anywhere; font-size: .9rem; }
+
+        .st-key-market_mood, .st-key-follow_panel, .st-key-heat_panel {
+            background: var(--surface);
+            border-radius: .75rem;
+        }
+        .st-key-overview_body { margin-top: 1rem; }
+        .market-totals dl { display: flex; flex-wrap: wrap; gap: .5rem 1.6rem; margin: .85rem 0; }
+        .market-totals dt { color: var(--muted); font-size: .82rem; }
+        .market-totals dd { margin: 0; color: var(--brand); font-size: 1.6rem; line-height: 1.25; }
+        .mood-bar { display: flex; height: .55rem; border-radius: .3rem; overflow: hidden; background: var(--neutral-soft); }
+        .market-totals .mood-bar { margin-bottom: .65rem; }
+        .mood-bar > span { flex: var(--count) 1 0; background: var(--mood); min-width: 0; }
+        .mood-positive { --mood: var(--positive); --mood-soft: var(--positive-soft); }
+        .mood-neutral { --mood: var(--neutral); --mood-soft: var(--neutral-soft); }
+        .mood-negative { --mood: var(--negative); --mood-soft: var(--negative-soft); }
+        .st-key-overview_positive { --mood: var(--positive); --mood-soft: var(--positive-soft); }
+        .st-key-overview_neutral { --mood: var(--neutral); --mood-soft: var(--neutral-soft); }
+        .st-key-overview_negative { --mood: var(--negative); --mood-soft: var(--negative-soft); }
+        .st-key-market_mood div.stButton button {
+            color: var(--mood);
+            background: var(--mood-soft);
+            border-color: transparent;
+            font-variant-numeric: tabular-nums;
+            padding-inline: .25rem;
+            min-height: 2.5rem;
+        }
+        .st-key-market_mood div.stButton button:is(:hover, [kind="primary"]) {
+            border-color: var(--mood);
+        }
+        .st-key-heat_panel div.stButton button { font-variant-numeric: tabular-nums; }
+        .st-key-heat_panel div.stButton button[kind="secondary"]:hover {
+            background: var(--brand-soft);
+        }
+        .st-key-overview_flow [data-testid="stCaptionContainer"] { color: var(--muted); }
 
         .sector-heading {
             display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 1rem;
-            padding: 0.78rem 0.95rem;
-            border-bottom: 1px solid var(--line);
-        }
-
-        .sector-heading .sector-name {
-            font-family: var(--serif);
-            color: var(--ink);
-            font-size: 19px;
-            font-weight: 700;
-            overflow-wrap: anywhere;
-            border-left: 3px solid var(--red);
-            padding: 0 0 0 10px;
-            margin: 0;
-            line-height: 1.3;
-        }
-
-        .sector-meta {
-            display: flex;
-            gap: 0.4rem;
-            flex-wrap: wrap;
-            justify-content: flex-end;
-        }
-
-        .pill {
-            display: inline-flex;
-            align-items: center;
-            border-radius: 999px;
-            border: 1px solid var(--line);
-            background: var(--paper);
-            color: var(--muted);
-            padding: 0.18rem 0.52rem;
-            font-size: 0.75rem;
-            white-space: nowrap;
-            font-variant-numeric: tabular-nums;
-        }
-
-        .pill.warn {
-            border-color: var(--amber-line);
-            background: var(--amber-soft);
-            color: var(--amber);
-        }
-
-        .section-warning {
-            color: var(--amber);
-            background: var(--amber-soft);
-            border-bottom: 1px solid var(--amber-line);
-            padding: 0.62rem 0.95rem;
-            font-size: 0.82rem;
-            overflow-wrap: anywhere;
-        }
-
-        .news-list {
-            padding: 0.3rem 0;
-        }
-
-        .news-card {
-            border-bottom: 1px solid var(--line);
-            background: var(--surface);
-            padding: 14px 16px;
-            transition: background-color 120ms ease;
-        }
-
-        .news-card:last-child {
-            border-bottom: 0;
-        }
-
-        .news-card:hover {
-            background: #fbfaf7;
-        }
-
-        .news-card .news-title {
-            margin: 0 0 6px;
-            padding: 0;
-            color: var(--ink);
-            font-size: 17px;
-            line-height: 1.5;
-            font-weight: 600;
-            overflow-wrap: anywhere;
-            word-break: break-word;
-        }
-
-        .news-meta {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 5px 8px;
-            color: var(--muted);
-            font-size: 12px;
-            line-height: 1.5;
-            font-variant-numeric: tabular-nums;
-        }
-
-        .keyword-tag {
-            border-radius: 3px;
-            background: var(--surface-soft);
-            border: 1px solid var(--line);
-            color: var(--ink-soft);
-            padding: 1px 6px;
-            font-size: 12px;
-            font-weight: 500;
-        }
-
-        .news-link {
-            margin-left: auto;
-            color: var(--red) !important;
-            text-decoration: none !important;
-            font-weight: 600;
-            white-space: nowrap;
-        }
-
-        .news-link:hover {
-            color: var(--red-deep) !important;
-            text-decoration: underline !important;
-        }
-
-        .empty-state {
-            padding: 0.9rem 0.95rem;
-            color: var(--muted);
-            background: var(--surface);
-        }
-
-        /* ---- 标签：红=利好，绿=利空，琥珀=高影响 ---- */
-        .tag {
-            display: inline-flex;
-            align-items: center;
-            border-radius: 3px;
-            padding: 1px 8px;
-            font-size: 12px;
-            font-weight: 600;
-            line-height: 1.6;
-            border: 1px solid transparent;
-            white-space: nowrap;
-        }
-
-        .tag-pos { background: var(--red-soft); color: var(--red-deep); border-color: var(--red-line); }
-        .tag-neg { background: var(--green-soft); color: var(--green); border-color: var(--green-line); }
-        .tag-neu { background: var(--surface-soft); color: var(--muted); border-color: var(--line); }
-        .tag-impact-high { background: var(--amber-soft); color: var(--amber); border-color: var(--amber-line); }
-        .tag-impact-medium { background: var(--surface-soft); color: var(--muted); border-color: var(--line); }
-        .tag-impact-low { background: transparent; color: var(--faint); border-color: var(--line); }
-        .tag-hot { background: var(--red); color: #ffffff; border-color: var(--red); }
-        .tag-cat-policy { background: transparent; color: var(--ink-soft); border-color: var(--line-strong); }
-        .tag-cat-stock_move { background: transparent; color: var(--faint); border-color: var(--line); }
-        .tag-low-conf { background: var(--amber-soft); color: var(--amber); border-color: var(--amber-line); }
-
-        details.related-reports {
-            margin-top: 6px;
-            font-size: 12px;
-            color: var(--muted);
-        }
-
-        details.related-reports summary {
-            cursor: pointer;
-            color: var(--red);
-            font-weight: 500;
-        }
-
-        .related-item {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-            padding: 4px 0 0 12px;
-            color: var(--muted);
-        }
-
-        .related-item a {
-            color: var(--ink-soft) !important;
-            text-decoration: none !important;
-        }
-
-        .related-item a:hover {
-            color: var(--red) !important;
-            text-decoration: underline !important;
-        }
-
-        .news-tags {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            margin: 0 0 6px;
-        }
-
-        .news-reason {
-            display: flex;
-            justify-content: space-between;
             align-items: baseline;
-            gap: 12px;
+            justify-content: space-between;
             flex-wrap: wrap;
-            color: var(--ink-soft);
-            font-size: 13px;
-            margin-top: 7px;
-            overflow-wrap: anywhere;
+            gap: .5rem 1rem;
+            border-bottom: 1px solid var(--line);
+            margin-bottom: .7rem;
         }
-
-        .st-key-news_navigation [role="tab"] {
-            min-height: 2.75rem;
-            padding-inline: 0.75rem;
+        .sector-heading .sector-name { font: 750 1.22rem/1.4 var(--serif); color: var(--brand); }
+        .sector-meta, .news-tags, .news-sectors, .news-meta, .news-top {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: .35rem .5rem;
+        }
+        .pill, .tag {
+            border-radius: .3rem;
+            padding: .13rem .45rem;
             color: var(--muted);
-        }
-
-        .st-key-news_navigation [role="tab"][aria-selected="true"] {
-            color: var(--red-deep);
-            font-weight: 700;
-        }
-
-        .st-key-news_navigation [role="tab"]:focus-visible {
-            outline: 2px solid var(--red);
-            outline-offset: -3px;
-        }
-
-        .hot-card {
-            border: 1px solid var(--line);
-            border-left: 3px solid var(--red);
-            border-radius: 3px;
-            background: var(--surface);
-            padding: 14px 16px;
-            margin-bottom: 0.6rem;
-        }
-
-        .hot-card .hot-title {
-            font-size: 18px;
-            font-weight: 650;
-            color: var(--ink);
-            margin: 6px 0 4px;
-            padding: 0;
+            background: var(--soft);
+            font-size: .76rem;
             line-height: 1.45;
             overflow-wrap: anywhere;
         }
-
-        .hot-sectors {
-            color: var(--ink-soft);
-            font-size: 13px;
-            margin-top: 3px;
-        }
-
-        /* ---- 侧边栏结构：眉题分组 + 轻量操作 + 扁平分组列表 ---- */
-        [data-testid="stSidebar"] h3.side-label {
-            border-top: 1px solid var(--line);
-            margin: 0.35rem 0 0;
-            padding: 0.85rem 0 0;
-        }
-
-        [data-testid="stSidebar"] .sector-status {
-            font-size: 12px;
+        .tag-sentiment { color: var(--mood); background: var(--mood-soft); font-weight: 700; }
+        .tag-emphasis { color: var(--brand); background: var(--brand-soft); font-weight: 700; }
+        .section-warning, .empty-state {
+            border-radius: .45rem;
+            background: var(--surface);
+            padding: .8rem 1rem;
             color: var(--muted);
-            font-variant-numeric: tabular-nums;
-            white-space: nowrap;
+            overflow-wrap: anywhere;
         }
-
-        [data-testid="stSidebar"] .st-key-sector_toolbar div.stButton > button {
-            width: 100%;
-            min-height: 1.7rem;
-            padding: 0.2rem 0.3rem;
-            border: none;
-            background: transparent;
-            color: var(--red);
-            font-size: 12.5px;
-            font-weight: 600;
+        .section-warning { border-inline-start: 3px solid var(--brand); margin-bottom: .65rem; }
+        .news-card {
+            background: var(--surface);
+            border: 1px solid var(--line);
+            border-inline-start: 4px solid var(--mood);
+            border-radius: .6rem;
+            padding: .8rem 1rem;
+            margin-bottom: .65rem;
+            min-width: 0;
+            overflow-wrap: anywhere;
         }
-
-        [data-testid="stSidebar"] .st-key-sector_toolbar div.stButton > button:hover {
-            color: var(--red-deep);
-            background: transparent;
-            text-decoration: underline;
+        .news-top { justify-content: space-between; }
+        .news-time { color: var(--brand); font-size: .85rem; font-weight: 750; }
+        .news-card .news-title {
+            color: var(--ink);
+            font: 700 1.13rem/1.45 var(--sans);
+            padding: 0;
+            margin: .4rem 0 .55rem;
         }
-
-        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stExpander"] {
-            border: 0;
-            border-bottom: 1px solid var(--line);
-            border-radius: 0;
-            background: transparent;
+        .news-meta, .news-sectors { color: var(--muted); font-size: .8rem; }
+        .news-meta { justify-content: space-between; margin-top: .55rem; }
+        .news-reason {
+            margin-top: .55rem;
+            padding: .48rem .65rem;
+            border-radius: .35rem;
+            background: var(--soft);
+            font-size: .85rem;
+            line-height: 1.55;
         }
+        .news-reason strong { margin-inline-end: .45rem; color: var(--brand); }
+        .confidence { display: inline-flex; align-items: center; gap: .3rem; color: var(--muted); }
+        .confidence-bars { display: inline-flex; gap: 2px; }
+        .confidence-bars i { width: .36rem; height: .34rem; border-radius: 1px; background: #dce1e7; }
+        .confidence-bars .filled { background: var(--brand); }
+        .news-card a, .related-reports summary { color: var(--brand); font-weight: 650; }
+        .news-card a:hover, .related-reports summary:hover { text-decoration: underline; }
+        .related-reports { margin-top: .5rem; font-size: .8rem; color: var(--muted); }
+        .related-reports summary { cursor: pointer; }
+        .related-item { padding: .3rem .65rem 0; }
 
-        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stExpander"] details {
-            border: none;
-            background: transparent;
-        }
-
-        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stExpander"] summary {
-            padding: 0.5rem 0.15rem;
-        }
-
-        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stExpander"] summary:hover {
-            color: var(--red-deep);
-        }
-
-        [data-testid="stSidebar"] .st-key-sector_groups [data-testid="stCheckbox"] {
-            min-height: 1.55rem;
-        }
-
-        [data-testid="stSidebar"] [role="radiogroup"] {
-            gap: 0.25rem 0.9rem;
-            flex-wrap: wrap;
-        }
-
-        [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
-        [data-testid="stSidebar"] [data-testid="stCaptionContainer"] * {
-            color: var(--faint);
-            font-size: 12.5px;
-        }
-
-        @media (prefers-reduced-motion: reduce) {
-            .news-card,
-            div.stButton > button {
-                transition: none;
+        @media (max-width: 860px) {
+            :is(.st-key-overview_top, .st-key-overview_body, .st-key-main_filters) [data-testid="stHorizontalBlock"] {
+                flex-wrap: wrap;
+            }
+            :is(.st-key-overview_top, .st-key-overview_body, .st-key-main_filters) [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+                flex: 1 1 100%;
+                width: 100%;
+            }
+            .st-key-market_mood [data-testid="stHorizontalBlock"] { flex-wrap: nowrap; }
+            .st-key-market_mood [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+                flex: 1 1 0;
+                width: auto;
+                min-width: 0 !important;
             }
         }
-
-        @media (max-width: 900px) {
-            .masthead-top {
-                flex-direction: column;
-                gap: 0.2rem;
-            }
-
-            .ticker-strip .stat {
-                padding: 0 0.8rem;
-            }
-
-            .sector-heading {
-                align-items: flex-start;
-                flex-direction: column;
-            }
-
-            .news-link {
-                margin-left: 0;
-            }
-        }
-
-        @media (max-width: 768px) {
-            .block-container {
-                padding: 0.9rem 0.75rem 2rem;
-            }
-
-            [data-testid="stSidebar"] {
-                min-width: 260px !important;
-                max-width: 300px !important;
-            }
-
-            .masthead .masthead-title {
-                font-size: 24px;
-            }
-
-            .ticker-strip .stat {
-                padding-inline: 0.35rem;
-            }
-
-            .stat-label {
-                font-size: 11px;
-            }
-
-            .hot-card .hot-title {
-                font-size: 16px;
-            }
-
-            .news-reason {
-                font-size: 12px;
-            }
-
-            .sector-heading {
-                padding: 12px;
-                gap: 8px;
-            }
-
-            .sector-heading .sector-name {
-                font-size: 17px;
-            }
-
-            .pill {
-                font-size: 12px;
-                padding: 2px 7px;
-            }
-
-            .news-card {
-                padding: 12px;
-            }
-
-            .news-card .news-title {
-                font-size: 15px;
-                line-height: 1.5;
-            }
-
-            .news-meta {
-                align-items: flex-start;
-                gap: 4px 8px;
-                font-size: 12px;
-            }
-
-            .keyword-tag {
-                font-size: 12px;
-                padding: 1px 5px;
-            }
-
-            .news-link {
-                flex-basis: 100%;
-                margin-left: 0;
-                padding-top: 2px;
-            }
+        @media (max-width: 600px) {
+            .block-container { padding: 3.5rem .85rem 2rem; }
+            .news-card { padding: .7rem .75rem; }
         }
         </style>
         """,
@@ -869,96 +412,6 @@ def deduplicate_display_news(
     return pd.concat(deduped_frames, ignore_index=True).reset_index(drop=True)
 
 
-def grouped_sectors(sectors_config: dict[str, Any]) -> list[tuple[str, list[str]]]:
-    grouped: list[tuple[str, list[str]]] = []
-    assigned_sectors: set[str] = set()
-
-    for group_name, sector_names in SECTOR_GROUPS.items():
-        sectors = [sector for sector in sector_names if sector in sectors_config]
-        if sectors:
-            grouped.append((group_name, sectors))
-            assigned_sectors.update(sectors)
-
-    remaining_sectors = [sector for sector in sectors_config if sector not in assigned_sectors]
-    if remaining_sectors:
-        grouped.append(("其他", remaining_sectors))
-
-    return grouped
-
-
-def sector_matches_query(sector: str, sector_keywords: Any, query: str) -> bool:
-    if not query:
-        return True
-    return query in sector.casefold() or any(
-        query in item.casefold() for item in extract_sector_keywords(sector_keywords)
-    )
-
-
-def render_sector_selector(sectors_config: dict[str, Any], sector_query: str) -> list[str]:
-    normalized_query = sector_query.strip().casefold()
-    visible_sectors = [
-        sector
-        for sector, sector_keywords in sectors_config.items()
-        if sector_matches_query(sector, sector_keywords, normalized_query)
-    ]
-    # 状态 + 全选/清空 放在同一行：状态是信息，操作降为文字钮。
-    # 先处理按钮点击再计算已选数，保证状态行反映本次操作的结果。
-    with st.sidebar.container(key="sector_toolbar"):
-        status_col, select_col, clear_col = st.columns(
-            [1.6, 0.7, 0.7], vertical_alignment="center"
-        )
-        if select_col.button("全选", key="select_all_sectors"):
-            for sector in sectors_config:
-                st.session_state[f"sector_selected::{sector}"] = True
-        if clear_col.button("清空", key="clear_all_sectors"):
-            for sector in sectors_config:
-                st.session_state[f"sector_selected::{sector}"] = False
-
-        selected_count = sum(
-            1
-            for sector in sectors_config
-            if st.session_state.get(f"sector_selected::{sector}", False)
-        )
-        if normalized_query:
-            status_text = f"匹配 {len(visible_sectors)} · 已选 {selected_count}"
-        else:
-            status_text = f"已选 {selected_count} / {len(sectors_config)} 个板块"
-        status_col.markdown(
-            f'<div class="sector-status">{escape(status_text)}</div>',
-            unsafe_allow_html=True,
-        )
-
-    visible_set = set(visible_sectors)
-    has_visible_group = False
-    with st.sidebar.container(key="sector_groups"):
-        for group_name, sectors in grouped_sectors(sectors_config):
-            visible_group_sectors = [
-                sector for sector in sectors if sector in visible_set
-            ]
-            if not visible_group_sectors:
-                continue
-
-            has_visible_group = True
-            selected_in_group = sum(
-                1
-                for sector in sectors
-                if st.session_state.get(f"sector_selected::{sector}", False)
-            )
-            # 有选中的分组加粗，展开状态和计数一起把"选了什么"变得可扫读
-            label = f"{group_name} · {selected_in_group}/{len(sectors)}"
-            if selected_in_group:
-                label = f"**{label}**"
-            expanded = bool(normalized_query) or selected_in_group > 0
-            with st.expander(label, expanded=expanded):
-                for sector in visible_group_sectors:
-                    st.checkbox(sector, key=f"sector_selected::{sector}")
-
-    if not has_visible_group:
-        st.sidebar.caption("没有匹配的板块，换个词试试。")
-
-    return visible_sectors
-
-
 def filter_news(news_df: pd.DataFrame, keyword: str, selected_sources: list[str]) -> pd.DataFrame:
     filtered_df = news_df
 
@@ -988,41 +441,6 @@ def filter_news(news_df: pd.DataFrame, keyword: str, selected_sources: list[str]
     return filtered_df.reset_index(drop=True)
 
 
-LOW_CONFIDENCE_TAG = '<span class="tag tag-low-conf">低置信</span>'
-DIVERGENT_TAG = '<span class="tag tag-neu">板块分化</span>'
-
-
-def sentiment_tag_html(sentiment: str, prefix: str = "") -> str:
-    css_class = {"positive": "tag-pos", "negative": "tag-neg"}.get(sentiment, "tag-neu")
-    label = SENTIMENT_LABELS.get(sentiment, "中性")
-    if prefix:
-        label = f"{prefix}·{label}"
-    return f'<span class="tag {css_class}">{escape(label)}</span>'
-
-
-def sentiment_tags_html(
-    sentiment: str,
-    low_confidence: bool = False,
-    divergent: bool = False,
-    prefix: str = "",
-) -> str:
-    html = sentiment_tag_html(sentiment, prefix)
-    if sentiment == "neutral":
-        if divergent:
-            html += DIVERGENT_TAG
-        elif low_confidence:
-            html += LOW_CONFIDENCE_TAG
-    return html
-
-
-def impact_tag_html(impact_level: str) -> str:
-    label = IMPACT_LABELS.get(impact_level, "低影响")
-    title_attr = ""
-    if impact_level == "high":
-        title_attr = ' title="依据政策、宏观事件或产业信号词判定"'
-    return f'<span class="tag tag-impact-{escape(impact_level)}"{title_attr}>{label}</span>'
-
-
 def _row_analysis(row: pd.Series) -> dict[str, Any]:
     analysis = row.get("analysis")
     if isinstance(analysis, dict):
@@ -1037,58 +455,16 @@ def _row_analysis(row: pd.Series) -> dict[str, Any]:
     }
 
 
-def _is_low_confidence(analysis: dict[str, Any]) -> bool:
-    return int(analysis.get("confidence", 0)) < 45
-
-
-def news_tags_html(row: pd.Series, hot_links: set[str] | None = None) -> str:
+def _row_sentiment(row: pd.Series) -> str:
     analysis = _row_analysis(row)
-    low_confidence = _is_low_confidence(analysis)
-    tags: list[str] = []
-
-    if str(row.get("news_type", "")) == "external_event":
-        assessments = analysis.get("sector_assessments") or {}
-        shown = 0
-        for sector, assessment in assessments.items():
-            tags.append(
-                sentiment_tag_html(assessment.get("sentiment", "neutral"), prefix=sector)
-            )
-            shown += 1
-            if shown >= 3:
-                break
-        if not assessments or analysis.get("divergent"):
-            tags.insert(
-                0,
-                sentiment_tags_html(
-                    analysis.get("sentiment", "neutral"),
-                    low_confidence=low_confidence,
-                    divergent=bool(analysis.get("divergent")),
-                ),
-            )
-    else:
-        sector_name = str(row.get("sector", "") or "").strip()
-        assessment = (analysis.get("sector_assessments") or {}).get(sector_name)
-        sentiment = (
-            assessment.get("sentiment") if assessment else analysis.get("sentiment", "neutral")
-        )
-        tags.append(
-            sentiment_tags_html(
-                sentiment,
-                low_confidence=low_confidence,
-                divergent=bool(analysis.get("divergent")),
-            )
-        )
-
-    tags.append(impact_tag_html(analysis.get("impact_level", "low")))
-    category = str(analysis.get("category", "general"))
-    if category in ("policy", "stock_move"):
-        tags.append(
-            f'<span class="tag tag-cat-{category}">{CATEGORY_LABELS.get(category, "")}</span>'
-        )
-    link = str(row.get("原文链接", ""))
-    if hot_links and link in hot_links:
-        tags.append('<span class="tag tag-hot">今日重点</span>')
-    return f'<div class="news-tags">{"".join(tags)}</div>'
+    sector = str(row.get("sector", "") or "").strip()
+    assessment = (analysis.get("sector_assessments") or {}).get(sector)
+    sentiment = (
+        assessment.get("sentiment")
+        if assessment and row.get("news_type") != "external_event"
+        else analysis.get("sentiment")
+    )
+    return sentiment if sentiment in SENTIMENT_LABELS else "neutral"
 
 
 def _row_reason(row: pd.Series) -> str:
@@ -1098,6 +474,7 @@ def _row_reason(row: pd.Series) -> str:
         assessment = (analysis.get("sector_assessments") or {}).get(sector_name)
         if assessment:
             return str(assessment.get("reason", ""))
+
     return str(analysis.get("reason", ""))
 
 
@@ -1133,102 +510,82 @@ def news_link_html(value: object, label: str = "查看原文", css_class: str = 
     )
 
 
+def confidence_html(confidence: int) -> str:
+    segments = 1 + (confidence >= LOW_CONFIDENCE_THRESHOLD) + (confidence >= 70)
+    bars = "".join(f'<i class="{ "filled" if index < segments else "" }"></i>' for index in range(3))
+    return (
+        f'<span class="confidence" role="img" aria-label="置信度 {confidence} / 100" '
+        f'title="置信度 {confidence} / 100">'
+        f'<span aria-hidden="true">置信度</span>'
+        f'<span class="confidence-bars" aria-hidden="true">{bars}</span></span>'
+    )
+
+
 def render_news_item(
     row: pd.Series,
     hot_links: set[str] | None = None,
     related_rows: list[pd.Series] | None = None,
 ) -> str:
-    title = escape(str(row.get("标题", "")))
-    source = escape(str(row.get("来源媒体", "")))
-    publish_time = escape(str(row.get("发布时间", "")))
-    keyword = escape(str(row.get("匹配关键词", "")))
-    link = news_link_html(row.get("原文链接"))
-    reason = escape(_row_reason(row))
-
-    return f"""
-        <article class="news-card">
-            <h4 class="news-title">{title}</h4>
-            {news_tags_html(row, hot_links)}
-            <div class="news-meta">
-                <span>{source}</span>
-                <span>{publish_time}</span>
-                <span class="keyword-tag">{keyword}</span>
-            </div>
-            <div class="news-reason">
-                <span>判断：{reason}</span>
-                {link}
-            </div>
-            {related_reports_html(related_rows or [])}
-        </article>
-        """
-
-
-def render_external_event_item(
-    row: pd.Series,
-    hot_links: set[str] | None = None,
-    related_rows: list[pd.Series] | None = None,
-) -> str:
-    title = escape(str(row.get("标题", "")))
-    source = escape(str(row.get("来源媒体", "")))
-    publish_time = escape(str(row.get("发布时间", "")))
-    keyword = escape(str(row.get("匹配关键词", "")))
-    event_category = escape(str(row.get("event_category", "")))
-    related_sectors = escape(str(row.get("related_sectors", "") or "未映射"))
-    link = news_link_html(row.get("原文链接"))
-    reason = escape(_row_reason(row))
-
-    return f"""
-        <article class="news-card">
-            <h4 class="news-title">{title}</h4>
-            {news_tags_html(row, hot_links)}
-            <div class="news-meta">
-                <span>{source}</span>
-                <span>{publish_time}</span>
-                <span class="keyword-tag">{event_category}</span>
-                <span class="keyword-tag">{keyword}</span>
-                <span>可能影响板块：{related_sectors}</span>
-            </div>
-            <div class="news-reason">
-                <span>判断：{reason}</span>
-                {link}
-            </div>
-            {related_reports_html(related_rows or [])}
-        </article>
-        """
-
-
-def render_hot_news_item(row: pd.Series) -> str:
     analysis = _row_analysis(row)
-    title = escape(str(row.get("标题", "")))
-    source = escape(str(row.get("来源媒体", "")))
-    publish_time = escape(str(row.get("发布时间", "")))
-    link = news_link_html(row.get("原文链接"))
-    reason = escape(str(analysis.get("reason", "")))
-    sectors = list((analysis.get("sector_assessments") or {}))
-    sectors_text = escape("、".join(sectors) if sectors else "暂无明确映射")
+    sentiment = _row_sentiment(row)
+    impact = analysis.get("impact_level", "low")
+    impact_class = " tag-emphasis" if impact == "high" else ""
+    tags = [
+        f'<span class="tag tag-sentiment">{escape(SENTIMENT_LABELS[sentiment])}</span>',
+        f'<span class="tag{impact_class}">{escape(IMPACT_LABELS.get(impact, "低影响"))}</span>',
+    ]
+    if analysis.get("divergent"):
+        tags.append('<span class="tag">板块分化</span>')
+    category = str(analysis.get("category", "general"))
+    if category in ("policy", "stock_move"):
+        tags.append(f'<span class="tag">{escape(CATEGORY_LABELS[category])}</span>')
+    if hot_links and row.get("原文链接") in hot_links:
+        tags.append('<span class="tag tag-emphasis">今日重点</span>')
 
-    tags = (
-        sentiment_tags_html(
-            analysis.get("sentiment", "neutral"),
-            low_confidence=_is_low_confidence(analysis),
-            divergent=bool(analysis.get("divergent")),
-        )
-        + impact_tag_html(analysis.get("impact_level", "low"))
+    sectors = target_sectors_for_row(row)
+    external = row.get("news_type") == "external_event"
+    assessments = analysis.get("sector_assessments") or {}
+    sector_tags = []
+    for sector in sectors:
+        direction = (assessments.get(sector) or {}).get("sentiment")
+        if external and direction in SENTIMENT_LABELS:
+            sector_tags.append(
+                f'<span class="tag tag-sentiment mood-{direction}">'
+                f'{escape(sector)} · {escape(SENTIMENT_LABELS[direction])}</span>'
+            )
+        else:
+            sector_tags.append(f'<span class="tag">{escape(sector)}</span>')
+    if external and not sector_tags:
+        sector_tags.append('<span class="tag">未映射</span>')
+    sectors_html = (
+        f'<div class="news-sectors"><span>影响板块</span>{"".join(sector_tags)}</div>'
+        if sector_tags else ""
+    )
+    metadata = " · ".join(
+        str(value) for value in (
+            row.get("来源媒体"),
+            row.get("event_category") if external else None,
+            row.get("匹配关键词"),
+        ) if value
     )
 
     return f"""
-        <article class="hot-card">
-            <div class="news-tags">{tags}</div>
-            <h3 class="hot-title">{title}</h3>
-            <div class="news-meta">
-                <span>来源：{source}</span>
-                <span>{publish_time}</span>
+        <article class="news-card mood-{sentiment}">
+            <div class="news-top">
+                <time class="news-time">{escape(str(row.get("发布时间") or "时间未知"))}</time>
+                <div class="news-tags">{"".join(tags)}</div>
             </div>
-            <div class="hot-sectors">影响板块：{sectors_text}</div>
+            <h4 class="news-title">{escape(str(row.get("标题", "")))}</h4>
+            {sectors_html}
             <div class="news-reason">
-                <span>判断：{reason}</span>
-                {link}
+                <strong>判断</strong>{escape(_row_reason(row))}
             </div>
+            <div class="news-meta">
+                <span>{escape(metadata)}</span>
+                {confidence_html(int(analysis.get("confidence", 0)))}
+                {news_link_html(row.get("原文链接"))}
+            </div>
+            {related_reports_html(related_rows or [])}
         </article>
         """
 
@@ -1329,20 +686,6 @@ def render_daily_digest_section(
             st.caption(f"已选板块较多，仅生成前 {MAX_DIGEST_SECTORS} 个板块的日报以控制成本。")
 
 
-def show_hot_news_section(
-    hot_df: pd.DataFrame, used_fallback: bool, scope_label: str
-) -> None:
-    st.subheader("今日重点新闻")
-    st.caption(f"从{scope_label}中选取重点新闻，优先展示与关注板块相关的报道。")
-    if hot_df is None or hot_df.empty:
-        st.info("今日暂无足够重要的新闻。可以尝试刷新数据或选择更多板块。")
-        return
-    if used_fallback:
-        st.caption("今日重点新闻不足，已补充最近 24 小时的重要新闻。")
-    cards = "".join(render_hot_news_item(row) for _, row in hot_df.iterrows())
-    st.markdown(cards, unsafe_allow_html=True)
-
-
 def sentiment_pills_html(analyses) -> str:
     counts = sentiment_counts(analyses)
     return (
@@ -1392,7 +735,7 @@ def show_sector_section(
             )
             for primary, related in clusters[:max_items]
         )
-        body_html = warning_html + f'<div class="news-list">{news_html}</div>'
+        body_html = warning_html + news_html
 
     sentiment_pills = (
         sentiment_pills_html(filtered_df["analysis"])
@@ -1444,14 +787,14 @@ def show_external_events_section(
         sorted_df = sort_news_by_importance(filtered_df)
         clusters = group_similar_news(sorted_df.head(max_items * 3))
         news_html = "".join(
-            render_external_event_item(
+            render_news_item(
                 sorted_df.iloc[primary],
                 hot_links,
                 [sorted_df.iloc[position] for position in related],
             )
             for primary, related in clusters[:max_items]
         )
-        body_html = warning_html + f'<div class="news-list">{news_html}</div>'
+        body_html = warning_html + news_html
 
     sentiment_pills = (
         sentiment_pills_html(filtered_df["analysis"])
@@ -1475,44 +818,188 @@ def show_external_events_section(
     )
 
 
-def render_dashboard_header(
-    today_total: int,
-    hot_count: int,
-    today_counts: dict[str, int],
-) -> None:
+def render_dashboard_header() -> None:
     now = now_utc8_naive()
-    weekday_names = "一二三四五六日"
-    date_text = (
-        f"{now.year}年{now.month}月{now.day}日 · 星期{weekday_names[now.weekday()]}"
-    )
-    stats = [
-        ("今日新闻", today_total, ""),
-        ("重点新闻", hot_count, ""),
-        ("利好", today_counts.get("positive", 0), "up"),
-        ("中性", today_counts.get("neutral", 0), ""),
-        ("利空", today_counts.get("negative", 0), "down"),
-    ]
-    stats_html = "".join(
-        f"""
-        <span class="stat">
-            <span class="stat-label">{escape(label)}</span>
-            <span class="stat-num {css_class}">{value}</span>
-        </span>
-        """
-        for label, value, css_class in stats
-    )
+    weekday = "一二三四五六日"[now.weekday()]
+    date_text = f"{now:%Y.%m.%d} · 星期{weekday} · 北京时间"
     st.markdown(
         f"""
-        <section class="masthead">
-            <div class="masthead-top">
-                <h1 class="masthead-title">板块新闻</h1>
-                <div class="masthead-date">{escape(date_text)}</div>
-            </div>
-            <div class="ticker-strip">{stats_html}</div>
+        <header class="masthead">
+            <h1 class="masthead-title">板块新闻</h1>
+            <time class="masthead-date">{escape(date_text)}</time>
+        </header>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def market_today(news: pd.DataFrame) -> pd.DataFrame:
+    if news.empty:
+        return news
+    return news[parse_publish_times(news).dt.date.eq(now_utc8_naive().date())]
+
+
+def filter_overview_sectors(news: pd.DataFrame, sectors: list[str]) -> pd.DataFrame:
+    if news.empty or not sectors:
+        return news
+    wanted = set(sectors)
+    matches = [
+        bool(wanted.intersection(target_sectors_for_row(row)))
+        for row in news.to_dict("records")
+    ]
+    return news.loc[matches]
+
+
+def render_market_brief(today: pd.DataFrame, hot_today: pd.DataFrame) -> None:
+    headline = "今天还没有新闻"
+    points = []
+    if not hot_today.empty:
+        lead = hot_today.iloc[0]
+        headline = str(lead.get("标题") or "今日重点")
+        direction = SENTIMENT_LABELS[_row_sentiment(lead)]
+        impact = IMPACT_LABELS.get(_row_analysis(lead).get("impact_level"), "低影响")
+        points.append(f"头条判断 · {direction} / {impact}：{_row_reason(lead)}")
+        points.extend(
+            f'{SENTIMENT_LABELS[_row_sentiment(row)]} · {row["标题"]}'
+            for _, row in hot_today.iloc[1:3].iterrows()
+        )
+    elif not today.empty:
+        headline = "今日已有新闻，暂无重点"
+    else:
+        points.append("后台会定时更新新闻，也可以在下方查看已有报道。")
+    bullets = "".join(f"<li>{escape(point)}</li>" for point in points)
+    st.markdown(
+        f"""
+        <section class="briefing">
+            <h2 class="briefing-label">今日速览</h2>
+            <p class="briefing-headline">{escape(headline)}</p>
+            <ul>{bullets}</ul>
         </section>
         """,
         unsafe_allow_html=True,
     )
+
+
+def toggle_overview_filter(key: str, value: str) -> None:
+    st.session_state[key] = "" if st.session_state.get(key) == value else value
+
+
+def render_market_mood(today: pd.DataFrame, hot_count: int) -> None:
+    counts = sentiment_counts(today["analysis"]) if not today.empty else dict.fromkeys(SENTIMENT_LABELS, 0)
+    segments = "".join(
+        f'<span class="mood-{sentiment}" style="--count:{counts[sentiment]}"></span>'
+        for sentiment in SENTIMENT_LABELS if counts[sentiment]
+    )
+    st.markdown(
+        f"""
+        <section class="market-totals">
+            <h3>情绪分布</h3>
+            <dl><div><dt>今日新闻</dt><dd><strong>{len(today)}</strong></dd></div>
+                <div><dt>今日重点</dt><dd><strong>{hot_count}</strong></dd></div></dl>
+            <div class="mood-bar" aria-hidden="true">{segments}</div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+    for column, (sentiment, label) in zip(st.columns(3), SENTIMENT_LABELS.items()):
+        column.button(
+            f"{label} {counts[sentiment]}",
+            key=f"overview_{sentiment}",
+            width="stretch",
+            type="primary" if st.session_state.overview_sentiment == sentiment else "secondary",
+            on_click=toggle_overview_filter,
+            args=("overview_sentiment", sentiment),
+        )
+
+
+def render_sector_heat(today: pd.DataFrame) -> None:
+    st.subheader("板块热度榜")
+    counts = Counter(
+        sector
+        for row in today.to_dict("records")
+        for sector in set(target_sectors_for_row(row))
+    )
+    if not counts:
+        st.caption("今天还没有板块热度数据。")
+        return
+    st.caption("按今日新闻条数排序")
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    for rank, (sector, count) in enumerate(ranked[:6], 1):
+        st.button(
+            f"{rank:02d}　{sector} · {count} 条",
+            key=f"overview_heat::{sector}",
+            width="stretch",
+            type="primary" if st.session_state.overview_sector == sector else "secondary",
+            on_click=toggle_overview_filter,
+            args=("overview_sector", sector),
+        )
+
+
+def render_overview_flow(
+    pool: pd.DataFrame,
+    sectors: list[str],
+    time_range: str,
+    keyword: str,
+    sources: list[str],
+    max_items: int,
+    hot_links: set[str],
+) -> None:
+    st.subheader("重点新闻")
+    active_sector = st.session_state.overview_sector
+    active_sentiment = st.session_state.overview_sentiment
+    if active_sector or active_sentiment:
+        labels = [active_sector, SENTIMENT_LABELS.get(active_sentiment, "")]
+        st.caption("概览筛选 · " + " · ".join(label for label in labels if label))
+        st.button(
+            "清除概览筛选", key="clear_overview_filters", on_click=clear_overview_filters
+        )
+    if pool.empty:
+        st.info("缓存暂无此新闻类型的报道，后台任务会定时更新。")
+        return
+
+    display = filter_overview_sectors(pool, [active_sector] if active_sector else sectors)
+    display = filter_news(filter_news_by_time(display, time_range), keyword, sources)
+    if active_sentiment:
+        display = display.loc[
+            [_row_sentiment(row) == active_sentiment for _, row in display.iterrows()]
+        ]
+    if display.empty:
+        st.info("当前筛选条件下暂无相关新闻。试试扩大时间范围或调整筛选条件。")
+        return
+
+    hot, used_fallback = select_hot_news(display, [active_sector] if active_sector else sectors)
+    if used_fallback:
+        st.caption("今日重点不足，已补充最近 24 小时的报道。")
+    if not hot.empty:
+        st.markdown(
+            "".join(render_news_item(row, hot_links) for _, row in hot.iterrows()),
+            unsafe_allow_html=True,
+        )
+
+    # 重点报道优先占据同组首位，其余报道继续沿用板块页的排序和事件折叠。
+    hot_items = set(zip(hot["标题"], hot["原文链接"]))
+    remaining = display.loc[
+        [item not in hot_items for item in zip(display["标题"], display["原文链接"])]
+    ]
+    if remaining.empty or len(hot) >= max_items:
+        return
+    ordered = pd.concat(
+        [hot, sort_news_by_importance(remaining).head(max_items * 3)], ignore_index=True
+    )
+    clusters = group_similar_news(ordered)
+    additional = [(primary, related) for primary, related in clusters if primary >= len(hot)]
+    if additional:
+        st.subheader("更多新闻")
+        st.markdown(
+            "".join(
+                render_news_item(
+                    ordered.iloc[primary], hot_links,
+                    [ordered.iloc[position] for position in related],
+                )
+                for primary, related in additional[:max_items - len(hot)]
+            ),
+            unsafe_allow_html=True,
+        )
 
 
 def set_config_notice(message: str) -> None:
@@ -1700,20 +1187,53 @@ def render_event_config_manager(
 
 
 FILTER_STATE_DEFAULTS: dict[str, Any] = {
-    "sector_query": "",
     "display_scope": "全部",
     "time_range": "全部",
     "keyword_search": "",
     "max_items": 30,
     "source_filter": [],
+    "overview_sector": "",
+    "overview_sentiment": "",
 }
 
 
+def clear_overview_filters() -> None:
+    st.session_state.overview_sector = ""
+    st.session_state.overview_sentiment = ""
+
+
+def clear_overview_sector() -> None:
+    st.session_state.overview_sector = ""
+
+
+def set_followed_sectors(sectors: list[str]) -> None:
+    st.session_state.followed_sectors = sectors
+    clear_overview_sector()
+
+
 def reset_all_filters(sectors_config: dict[str, Any]) -> None:
-    for sector in sectors_config:
-        st.session_state[f"sector_selected::{sector}"] = sector in DEFAULT_SELECTED_SECTORS
+    set_followed_sectors([sector for sector in DEFAULT_SELECTED_SECTORS if sector in sectors_config])
     for key, value in FILTER_STATE_DEFAULTS.items():
         st.session_state[key] = value
+
+
+def render_sector_selector(sectors_config: dict[str, Any]) -> list[str]:
+    options = list(sectors_config)
+    current = st.session_state.setdefault(
+        "followed_sectors", [sector for sector in DEFAULT_SELECTED_SECTORS if sector in sectors_config]
+    )
+    st.session_state.followed_sectors = [sector for sector in current if sector in sectors_config]
+    selected = st.multiselect(
+        "关注板块", options, key="followed_sectors", placeholder="搜索并选择板块",
+        on_change=clear_overview_sector,
+    )
+    st.caption(f"已关注 {len(selected)} / {len(options)} 个板块")
+    with st.container(horizontal=True, gap="small"):
+        st.button(
+            "全选", key="select_all_sectors", on_click=set_followed_sectors, args=(options,)
+        )
+        st.button("清空", key="clear_all_sectors", on_click=set_followed_sectors, args=([],))
+    return selected
 
 
 def _record_refresh_status(added_count: int) -> None:
@@ -1872,10 +1392,12 @@ def main() -> None:
     event_to_sectors = events_config["event_to_sectors"]
     llm_verifier, llm_notice = get_llm_verifier()
 
-    for sector in sectors_config:
-        st.session_state.setdefault(
-            f"sector_selected::{sector}",
-            sector in DEFAULT_SELECTED_SECTORS,
+    render_dashboard_header()
+    with st.container(key="main_filters"):
+        time_col, search_col = st.columns([1, 2])
+        time_range = time_col.selectbox("时间范围", TIME_RANGE_OPTIONS, key="time_range")
+        keyword = search_col.text_input(
+            "关键词搜索", placeholder="标题、匹配关键词或来源…", key="keyword_search"
         )
 
     st.sidebar.header("筛选")
@@ -1885,44 +1407,37 @@ def main() -> None:
     if events_config_error:
         st.sidebar.warning(events_config_error)
 
-    st.sidebar.markdown('<h3 class="side-label">新闻范围</h3>', unsafe_allow_html=True)
-    display_scope = st.sidebar.radio(
-        "新闻类型",
-        options=["全部", "板块新闻", "外部事件"],
-        key="display_scope",
-        horizontal=True,
-    )
+    with st.sidebar.expander("更多筛选", expanded=False):
+        display_scope = st.radio(
+            "新闻类型",
+            options=["全部", "板块新闻", "外部事件"],
+            key="display_scope",
+            horizontal=True,
+        )
+        source_filter_container = st.container()
+        max_items = st.slider(
+            "每组最多展示条数", min_value=5, max_value=100, key="max_items"
+        )
     show_sector_news = display_scope in ("全部", "板块新闻")
     show_external_events = display_scope in ("全部", "外部事件")
-    time_range = st.sidebar.radio(
-        "时间范围", options=TIME_RANGE_OPTIONS, key="time_range", horizontal=True
-    )
-    keyword = st.sidebar.text_input(
-        "关键词搜索", placeholder="标题、匹配关键词或来源…", key="keyword_search"
-    )
-    # 占位容器：来源媒体选项依赖缓存数据，数据加载后再填充，
-    # 但视觉位置保持在关键词搜索之后、展示条数之前
-    source_filter_container = st.sidebar.container()
-    max_items = st.sidebar.slider(
-        "每组最多展示条数", min_value=5, max_value=100, key="max_items"
-    )
 
-    st.sidebar.markdown('<h3 class="side-label">关注板块</h3>', unsafe_allow_html=True)
-    sector_query = st.sidebar.text_input(
-        "板块搜索",
-        placeholder="搜索板块或关键词…",
-        key="sector_query",
-        label_visibility="collapsed",
-    )
-    render_sector_selector(sectors_config, sector_query)
-    selected_sectors = [
-        sector
-        for sector in sectors_config
-        if st.session_state.get(f"sector_selected::{sector}", False)
-    ]
+    notices = st.container()
+    tab_labels = ["市场概览"]
+    if show_sector_news:
+        tab_labels.append("板块新闻")
+    if show_external_events:
+        tab_labels.append("外部事件")
+    tabs = dict(zip(tab_labels, st.tabs(tab_labels, key="news_navigation")))
 
-    st.sidebar.divider()
-    # 重置放底部：先看筛选项，逃生舱最后；用回调避免在组件实例化后改状态
+    with tabs["市场概览"]:
+        with st.container(key="overview_top"):
+            brief_col, mood_col = st.columns([2, 1])
+        with st.container(key="overview_body"):
+            follow_col, flow_col, heat_col = st.columns([1, 2.7, 1.2])
+        with follow_col.container(border=True, key="follow_panel"):
+            selected_sectors = render_sector_selector(sectors_config)
+        overview_footer = st.container()
+
     st.sidebar.button(
         "重置全部筛选", on_click=reset_all_filters, args=(sectors_config,)
     )
@@ -1953,10 +1468,10 @@ def main() -> None:
                 )
 
     (
-        raw_cache_display_df,
+        _,
         sector_deduped_df,
         external_deduped_df,
-        metadata,
+        _,
         cache_error,
         cache_refilter_warnings,
     ) = load_display_data(
@@ -1965,14 +1480,12 @@ def main() -> None:
         sectors_config,
         external_events,
     )
-    if cache_error:
-        st.warning(cache_error + "。页面将显示空缓存，管理员可在数据设置中全量刷新。")
-    # 常规的"已按新规则过滤旧缓存"属于后台正常行为，不展示；只提示真正的失败
-    refilter_failures = [
-        warning for warning in cache_refilter_warnings if "失败" in warning
-    ]
-    if refilter_failures:
-        st.warning("；".join(refilter_failures))
+    with notices:
+        if cache_error:
+            st.warning(cache_error + "。页面将显示空缓存，管理员可在数据设置中全量刷新。")
+        refilter_failures = [warning for warning in cache_refilter_warnings if "失败" in warning]
+        if refilter_failures:
+            st.warning("；".join(refilter_failures))
 
     sector_cache_display_df = filter_news_by_time(sector_deduped_df, time_range)
     external_display_df = filter_news_by_time(external_deduped_df, time_range)
@@ -1980,17 +1493,13 @@ def main() -> None:
         sector_cache_display_df["sector"].isin(selected_sectors)
     ].reset_index(drop=True)
 
-    source_frames: list[pd.DataFrame] = []
+    pool_frames = []
     if show_sector_news:
-        source_frames.append(selected_cache_display_df)
+        pool_frames.append(sector_deduped_df)
     if show_external_events:
-        source_frames.append(external_display_df)
-    source_df = (
-        pd.concat(source_frames, ignore_index=True)
-        if source_frames
-        else pd.DataFrame()
-    )
-    available_sources = collect_sources(source_df)
+        pool_frames.append(external_deduped_df)
+    overview_pool = pd.concat(pool_frames, ignore_index=True)
+    available_sources = collect_sources(filter_news_by_time(overview_pool, time_range))
     st.session_state.source_filter = [
         source
         for source in st.session_state.get("source_filter", [])
@@ -2015,75 +1524,41 @@ def main() -> None:
             warnings=tuple(warnings_by_sector.get(sector, [])),
         )
 
-    # 今日热点：从去重后的全部新闻中选取，不受时间范围筛选影响
-    hot_pool_frames: list[pd.DataFrame] = []
-    if show_sector_news:
-        hot_pool_frames.append(sector_deduped_df)
-    if show_external_events:
-        hot_pool_frames.append(external_deduped_df)
-    hot_pool_df = (
-        pd.concat(hot_pool_frames, ignore_index=True)
-        if hot_pool_frames
-        else pd.DataFrame()
-    )
-    hot_df, hot_used_fallback = select_hot_news(hot_pool_df, selected_sectors)
-    hot_links = (
-        set(hot_df["原文链接"].astype(str)) if not hot_df.empty else set()
-    )
+    today = market_today(overview_pool)
+    followed_today = filter_overview_sectors(today, selected_sectors)
+    hot_today, _ = select_hot_news(followed_today, selected_sectors)
+    hot_links = set(hot_today["原文链接"].astype(str)) - {""}
 
-    # 今日新闻统计：当前关注范围内、发布日期为今天（UTC+8）的新闻
-    today_scope_frames: list[pd.DataFrame] = []
-    if show_sector_news and selected_sectors:
-        today_scope_frames.append(
-            sector_deduped_df[sector_deduped_df["sector"].isin(selected_sectors)]
+    with brief_col:
+        render_market_brief(followed_today, hot_today)
+    with mood_col.container(border=True, key="market_mood"):
+        render_market_mood(followed_today, len(hot_today))
+        if selected_sectors:
+            st.caption("统计范围：关注板块")
+    with flow_col.container(key="overview_flow"):
+        render_overview_flow(
+            overview_pool, selected_sectors, time_range, keyword, selected_sources,
+            max_items, hot_links,
         )
-    if show_external_events:
-        today_scope_frames.append(external_deduped_df)
-    today_counts = {"positive": 0, "neutral": 0, "negative": 0}
-    today_total = 0
-    if today_scope_frames:
-        today_scope_df = pd.concat(today_scope_frames, ignore_index=True)
-        publish_times = parse_publish_times(today_scope_df)
-        today_mask = publish_times.dt.date.eq(now_utc8_naive().date()).fillna(False)
-        today_df = today_scope_df[today_mask]
-        today_total = len(today_df)
-        if "analysis" in today_df.columns:
-            today_counts = sentiment_counts(today_df["analysis"])
-
-    render_dashboard_header(
-        today_total=today_total,
-        hot_count=len(hot_df),
-        today_counts=today_counts,
-    )
-    st.caption(
-        "利好 / 利空 / 影响等级由规则与新闻文本自动生成，仅供信息参考，不构成投资建议。"
-    )
-
-    tab_labels = ["市场概览"]
-    if show_sector_news:
-        tab_labels.append("板块新闻")
-    if show_external_events:
-        tab_labels.append("外部事件")
-    tabs = dict(zip(tab_labels, st.tabs(tab_labels, key="news_navigation")))
-
-    with tabs["市场概览"]:
-        scope_label = "板块新闻和外部事件" if display_scope == "全部" else display_scope
-        st.caption(f"新闻类型：{scope_label} · 缓存共 {int(metadata['total'])} 条")
-        if raw_cache_display_df.empty:
-            st.info("缓存暂无新闻。后台任务会定时抓取，管理员也可手动刷新。")
-        else:
-            show_hot_news_section(hot_df, hot_used_fallback, scope_label)
+    with heat_col.container(border=True, key="heat_panel"):
+        render_sector_heat(today)
         if show_sector_news:
+            st.divider()
             render_daily_digest_section(
-                llm_verifier, selected_sectors, sector_deduped_df, can_generate=admin
+                llm_verifier, selected_sectors, sector_deduped_df,
+                can_generate=admin and not config_unavailable,
             )
+    with overview_footer:
+        st.caption(
+            "利好 / 利空 / 影响等级由规则与新闻文本自动生成，仅供信息参考，不构成投资建议。"
+        )
 
     if show_sector_news:
         with tabs["板块新闻"]:
             st.subheader("板块新闻")
             st.caption(f"已选 {len(selected_sectors)} 个板块 · 时间范围：{time_range}")
             if not selected_sectors:
-                st.info("在侧栏的「关注板块」中选择至少一个板块。")
+                st.info("在市场概览的「关注板块」中选择至少一个板块。")
             for sector in selected_sectors:
                 show_sector_section(
                     sector,
