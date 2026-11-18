@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -33,17 +35,17 @@ def test_dashboard_tabs_follow_news_scope_and_keep_empty_state(monkeypatch):
     app = AppTest.from_file(BASE_DIR / "main.py").run()
 
     assert not app.exception
-    assert [tab.label for tab in app.tabs] == ["市场概览", "板块新闻", "外部事件"]
+    assert [tab.label for tab in app.tabs] == ["市场概览", "板块新闻", "外部事件", "热度榜", "板块日报"]
     scope = next(radio for radio in app.sidebar.radio if radio.label == "新闻类型")
     scope.set_value("外部事件").run()
     assert not app.exception
-    assert [tab.label for tab in app.tabs] == ["市场概览", "外部事件"]
+    assert [tab.label for tab in app.tabs] == ["市场概览", "外部事件", "热度榜"]
 
     scope = next(radio for radio in app.sidebar.radio if radio.label == "新闻类型")
     scope.set_value("板块新闻").run()
     app.button(key="clear_all_sectors").click().run()
     assert not app.exception
-    assert [tab.label for tab in app.tabs] == ["市场概览", "板块新闻"]
+    assert [tab.label for tab in app.tabs] == ["市场概览", "板块新闻", "热度榜", "板块日报"]
     assert any("选择至少一个板块" in message.value for message in app.tabs[1].info)
 
 
@@ -128,17 +130,23 @@ def test_overview_filters_keep_followed_sectors_and_handle_no_matches(monkeypatc
 
     def overview_cards():
         return "".join(
-            item.value for item in app.tabs[0].markdown if 'class="news-card ' in item.value
+            item.value for item in app.tabs[0].html if 'class="news-card ' in item.value
         )
 
     assert not app.exception
-    assert titles[0] in overview_cards() and titles[1] in overview_cards()
+    cards = overview_cards()
+    assert "<h2>今日导读</h2>" in cards
+    assert cards.count('class="edition-lead"') == 1
+    assert cards.count(titles[0]) == cards.count(titles[1]) == 1
     app.button(key="overview_negative").click().run()
     assert titles[0] not in overview_cards()
     assert titles[1] in overview_cards()
 
     app.button(key="overview_negative").click().run()
+    app.session_state["news_navigation"] = "热度榜"
+    app.run()
     app.button(key="overview_heat::机器人").click().run()
+    assert app.session_state["news_navigation"] == "市场概览"
     assert titles[0] not in overview_cards()
     assert titles[2] in overview_cards()
     assert app.multiselect(key="followed_sectors").value == ["半导体芯片"]
@@ -150,7 +158,7 @@ def test_overview_filters_keep_followed_sectors_and_handle_no_matches(monkeypatc
 
 
 def test_shared_news_card_escapes_text_and_only_links_safe_urls():
-    from main import render_news_item
+    from main import news_share_id, render_news_item
 
     row = pd.Series(
         {
@@ -172,7 +180,7 @@ def test_shared_news_card_escapes_text_and_only_links_safe_urls():
         assert f"&lt;{value}&gt;" in html
     assert '<article class="news-card mood-negative">' in html
     assert 'aria-label="置信度 53 / 100"' in html
-    assert "href=" not in html
+    assert re.findall(r'href="([^"]*)"', html) == [f"?news={news_share_id(row)}"]
 
     row["原文链接"] = "https://example.com/story?a=1&b=2"
     html = render_news_item(row)
