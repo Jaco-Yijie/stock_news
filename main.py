@@ -1,9 +1,12 @@
 import hashlib
 import hmac
+import json
 import os
+import re
 from collections import Counter
 from html import escape
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 import requests
@@ -95,7 +98,7 @@ def inject_styles() -> None:
                     "Microsoft YaHei", sans-serif;
         }
         .stApp { font-family: var(--sans); }
-        .block-container { max-width: 1480px; padding: 3.75rem 2rem 3rem; }
+        .block-container { max-width: 1240px; padding: 3.75rem 2rem 3rem; }
         [data-testid="stSidebar"] { border-right: 1px solid var(--line); }
         .stApp :is(button, a, summary, input, textarea, [tabindex]):focus-visible {
             outline: 2px solid var(--brand);
@@ -109,16 +112,12 @@ def inject_styles() -> None:
         }
         .stApp :is(summary, [role="tab"]):hover { color: var(--brand); }
 
-        .masthead {
-            display: flex;
-            justify-content: space-between;
-            align-items: baseline;
-            gap: .5rem 1rem;
-            flex-wrap: wrap;
-            padding-bottom: .6rem;
-            margin-bottom: .8rem;
-            border-bottom: 3px double var(--brand);
+        .st-key-edition_header {
+            padding-bottom: .5rem;
+            border-bottom: 2px solid var(--brand);
         }
+        .st-key-edition_header [data-testid="stPopover"] { max-width: 7rem; margin-left: auto; }
+        .masthead { padding-bottom: .25rem; display: flex; align-items: baseline; flex-wrap: wrap; gap: .25rem 1rem; }
         .masthead .masthead-title {
             margin: 0;
             padding: 0;
@@ -133,37 +132,32 @@ def inject_styles() -> None:
         .st-key-news_navigation [role="tab"]:focus-visible { outline-offset: -3px; }
         .st-key-news_navigation [aria-selected="true"] { font-weight: 700; }
 
-        .briefing {
-            height: 100%;
-            padding: clamp(1rem, 2.2vw, 1.9rem);
+        .edition-lead {
+            padding: clamp(.85rem, 2vw, 1.4rem);
             background: var(--surface);
             border: 1px solid var(--line);
-            border-top: 4px solid var(--brand);
-            border-radius: .75rem;
+            border-top: 3px solid var(--brand);
+            border-radius: .6rem;
         }
-        .briefing .briefing-label, .market-totals h3 {
-            margin: 0;
-            padding: 0;
+        .edition-lead h2, .market-totals h3 {
+            padding: 0; margin: 0;
             color: var(--brand);
             font: 750 .95rem/1.4 var(--sans);
         }
-        .briefing .briefing-headline {
-            margin: .48rem 0 .75rem;
-            padding: 0;
-            color: var(--ink);
-            font: 800 clamp(1.4rem, 2.65vw, 2.25rem)/1.35 var(--serif);
-            overflow-wrap: anywhere;
+        .edition-lead .news-card {
+            padding: 0; margin: .65rem 0 0; border: none; border-radius: 0;
         }
-        .briefing ul { margin: 0; padding-left: 1.2rem; color: var(--muted); }
-        .briefing li + li { margin-top: .3rem; }
-        .briefing li { overflow-wrap: anywhere; font-size: .9rem; }
-        .briefing-more { display: none; }
-
-        .st-key-market_mood, .st-key-follow_panel, .st-key-heat_panel {
-            background: var(--surface);
-            border-radius: .75rem;
+        .edition-lead .news-card .news-title {
+            padding-left: .6rem;
+            border-left: 4px solid var(--mood);
+            font: 750 clamp(1.35rem, 2.6vw, 2.1rem)/1.38 var(--serif);
         }
-        .st-key-overview_body { margin-top: 1rem; }
+        .edition-feed {
+            display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+            align-items: start; gap: .75rem;
+        }
+        .edition-feed .news-card { margin-bottom: 0; }
+        .st-key-market_mood { background: var(--surface); border-radius: .6rem; }
         .market-totals dl { display: flex; flex-wrap: wrap; gap: .5rem 1.6rem; margin: .85rem 0; }
         .market-totals dt { color: var(--muted); font-size: .82rem; }
         .market-totals dd { margin: 0; color: var(--brand); font-size: 1.6rem; line-height: 1.25; }
@@ -188,10 +182,8 @@ def inject_styles() -> None:
         .st-key-market_mood div.stButton button:is(:hover, [kind="primary"]) {
             border-color: var(--mood);
         }
-        .st-key-heat_panel div.stButton button { font-variant-numeric: tabular-nums; }
-        .st-key-heat_panel div.stButton button[kind="secondary"]:hover {
-            background: var(--brand-soft);
-        }
+        .st-key-overview_flow h3 { font: 750 1.25rem/1.4 var(--sans); }
+        .st-key-article_detail { max-width: 48rem; margin-inline: auto; }
         .st-key-overview_flow [data-testid="stCaptionContainer"] { color: var(--muted); }
 
         .sector-heading {
@@ -269,75 +261,35 @@ def inject_styles() -> None:
         .related-item { padding: .3rem .65rem 0; }
 
         @media (max-width: 860px) {
-            :is(.st-key-overview_top, .st-key-overview_body) [data-testid="stHorizontalBlock"] {
-                flex-wrap: wrap;
-                row-gap: .65rem;
+            .edition-feed { grid-template-columns: 1fr; }
+            .st-key-overview_top > [data-testid="stHorizontalBlock"] {
+                flex-direction: column; gap: .65rem;
             }
-            :is(.st-key-overview_top, .st-key-overview_body) [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
-                flex: 1 1 100%;
-                width: 100%;
+            .st-key-overview_top > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+                width: 100%; flex: 1 1 auto;
             }
-            :is(.st-key-main_filters, .st-key-market_mood) [data-testid="stHorizontalBlock"] {
-                flex-wrap: nowrap;
-                gap: .5rem;
+            :is(.st-key-edition_header, .st-key-market_mood) [data-testid="stHorizontalBlock"] {
+                flex-wrap: nowrap; gap: .4rem;
             }
-            :is(.st-key-main_filters, .st-key-market_mood) [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
-                min-width: 0 !important;
-            }
-            .st-key-main_filters [data-testid="stColumn"]:first-child { flex: 1 1 0; }
-            .st-key-main_filters [data-testid="stColumn"]:last-child { flex: 2 1 0; }
-            .st-key-market_mood [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] { flex: 1 1 0; }
-            .st-key-market_mood [data-testid="stVerticalBlock"] { gap: .4rem; }
-            .st-key-news_navigation { margin-top: -.4rem; }
-            .st-key-news_navigation [role="tab"] { min-height: 2.5rem; }
-
-            .masthead { margin-bottom: .35rem; padding-bottom: .4rem; gap: .3rem .65rem; }
-            .masthead-date { font-size: .75rem; }
-            .briefing {
-                position: relative;
-                height: auto;
-                padding: .55rem .8rem .65rem;
-            }
-            .briefing:has(> .briefing-more) .briefing-label {
-                display: flex;
-                align-items: center;
-                min-height: 2.25rem;
-                padding-inline-end: 6rem;
-            }
-            .briefing .briefing-headline { font-size: 1.15rem; margin: .22rem 0 0; }
-            .briefing-points { display: none; }
-            .briefing-more {
-                display: block;
-                color: var(--brand);
-            }
-            .briefing-more[open] {
-                margin-top: .2rem;
-                padding-top: .35rem;
-            }
-            .briefing-more summary {
-                position: absolute;
-                inset: .55rem .8rem auto auto;
-                min-height: 2.25rem;
-                line-height: 2.25rem;
-                cursor: pointer;
-                font-size: .82rem;
-            }
-            .briefing-more summary:hover { text-decoration: underline; }
-            .briefing-more ul { margin-bottom: .3rem; }
-
+            :is(.st-key-edition_header, .st-key-market_mood) [data-testid="stColumn"] { min-width: 0 !important; }
+            .st-key-edition_header [data-testid="stColumn"]:first-child { flex: 1 1 auto; }
+            .st-key-edition_header [data-testid="stColumn"]:last-child { flex: 0 0 6.1rem; }
+            .st-key-market_mood [data-testid="stColumn"] { flex: 1 1 0; }
             .market-totals { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .7rem; }
-            .market-totals h3 { font-size: .82rem; }
-            .market-totals dl { gap: .3rem .65rem; margin: 0; }
-            .market-totals dt { font-size: .75rem; }
-            .market-totals dl > div { display: flex; align-items: baseline; gap: .3rem; }
-            .market-totals dd { font-size: .95rem; }
-            .market-totals .mood-bar { flex-basis: 100%; height: .35rem; margin-bottom: 0; }
-            .st-key-overview_body { margin-top: 0; }
-            .st-key-overview_flow h3 { font-size: 1.18rem; padding-block: .15rem 0; }
+            .market-totals dl { gap: .65rem; margin: 0; }
+            .market-totals dl > div { display: flex; align-items: baseline; gap: .25rem; }
+            .market-totals dd { font-size: 1rem; }
+            .market-totals .mood-bar { flex-basis: 100%; margin-bottom: 0; }
         }
         @media (max-width: 600px) {
-            .block-container { padding: 3rem .85rem 2rem; }
+            .block-container { padding: 3.25rem .85rem 2rem; }
+            .masthead-date { font-size: .75rem; }
+            .st-key-news_navigation [role="tablist"] { gap: .6rem; }
+            .st-key-news_navigation [role="tab"] { padding-inline: 0; }
+            .st-key-news_navigation [role="tab"] p { font-size: .85rem; }
             .news-card { padding: .7rem .75rem; }
+            .news-meta .news-link { display: inline-flex; align-items: center; min-height: 2.5rem; }
+            .st-key-overview_flow h3 { padding-block: .25rem; }
         }
         </style>
         """,
@@ -564,6 +516,29 @@ def news_link_html(value: object, label: str = "查看原文", css_class: str = 
     )
 
 
+def news_share_id(row: pd.Series) -> str:
+    # 同一条报道在不同板块可以有不同判断，链接需保留分享时的板块。
+    scope = (row.get("news_type") or "sector_news", row.get("sector") or "", row.get("event_category") or "")
+    source_link = safe_news_url(row.get("原文链接"))
+    identity = (source_link,) if source_link else tuple(
+        str(row.get(field) or "") for field in ("标题", "来源媒体", "发布时间")
+    )
+    key = json.dumps((*scope, *identity), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(key).hexdigest()[:24]
+
+
+def news_share_url(news_id: str, app_url: str | None) -> str:
+    query = f"news={news_id}"
+    if not safe_news_url(app_url):
+        return f"?{query}"
+    parts = urlsplit(app_url)
+    path = parts.path or "/"
+    # Community Cloud 的应用运行在内层页面，分享时要使用对外的页面地址。
+    if parts.hostname.endswith(".streamlit.app") and path.startswith("/~/"):
+        path = "/"
+    return urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+
+
 def confidence_html(confidence: int) -> str:
     segments = 1 + (confidence >= LOW_CONFIDENCE_THRESHOLD) + (confidence >= 70)
     bars = "".join(f'<i class="{ "filled" if index < segments else "" }"></i>' for index in range(3))
@@ -579,6 +554,8 @@ def render_news_item(
     row: pd.Series,
     hot_links: set[str] | None = None,
     related_rows: list[pd.Series] | None = None,
+    *,
+    show_share: bool = True,
 ) -> str:
     analysis = _row_analysis(row)
     sentiment = _row_sentiment(row)
@@ -622,6 +599,13 @@ def render_news_item(
             row.get("匹配关键词"),
         ) if value
     )
+    share_link = ""
+    if show_share:
+        url = news_share_url(news_share_id(row), st.context.url)
+        share_link = (
+            f'<a class="news-link" href="{escape(url, quote=True)}" target="_blank" '
+            'rel="noopener noreferrer">详情 / 分享</a>'
+        )
 
     return f"""
         <article class="news-card mood-{sentiment}">
@@ -638,10 +622,53 @@ def render_news_item(
                 <span>{escape(metadata)}</span>
                 {confidence_html(int(analysis.get("confidence", 0)))}
                 {news_link_html(row.get("原文链接"))}
+                {share_link}
             </div>
             {related_reports_html(related_rows or [])}
         </article>
         """
+
+
+def render_news_detail(
+    news_id: str,
+    sectors_config: dict[str, Any],
+    external_events: dict[str, Any],
+    config_errors: tuple[str | None, ...],
+) -> None:
+    st.button("返回新闻看板", on_click=st.query_params.pop, args=("news", None))
+    if not re.fullmatch(r"[0-9a-f]{24}", news_id):
+        st.info("新闻链接无效，请返回看板查看最新报道。")
+        return
+    for error in config_errors:
+        if error:
+            st.warning(error)
+    raw_news, _, _, _, cache_error, warnings = load_display_data(
+        st.session_state.cache_version,
+        get_cache_fingerprint(st.session_state.cache_version),
+        sectors_config,
+        external_events,
+    )
+    if cache_error:
+        st.warning("新闻缓存暂时无法读取，请稍后重新打开链接。")
+        return
+    for warning in warnings:
+        if "失败" in warning:
+            st.warning(warning)
+    for _, row in raw_news.iterrows():
+        if news_share_id(row) == news_id:
+            article = row.to_frame().T
+            article["analysis"] = analyze_display_frame(article)
+            st.html(render_news_item(article.iloc[0], show_share=False))
+            share_url = news_share_url(news_id, st.context.url)
+            if safe_news_url(share_url):
+                st.caption("复制链接，分享这条新闻")
+                st.code(share_url, language=None, wrap_lines=True)
+            content = str(row.get("新闻内容") or "").strip()
+            if content and content != row.get("标题"):
+                st.subheader("报道内容")
+                st.text(content)
+            return
+    st.info("当前缓存中没有这条新闻，报道可能已过期或移出看板。")
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -687,57 +714,57 @@ def render_daily_digest_section(
     *,
     can_generate: bool,
 ) -> None:
-    with st.expander("今日板块日报（LLM 生成）", expanded=False):
-        if llm_verifier is None:
-            st.info(
-                "未配置 LLM，无法生成日报。在环境变量或 Secrets 中配置 "
-                "LLM_VERIFY_PROVIDER 及豆包 / DeepSeek 密钥后可用。"
-            )
-            return
-        if not can_generate:
-            st.caption("管理员登录后可生成日报。")
-            return
-        if not selected_sectors:
-            st.info("请先选择板块。")
-            return
+    st.subheader("今日板块日报")
+    if llm_verifier is None:
+        st.info(
+            "未配置 LLM，无法生成日报。在环境变量或 Secrets 中配置 "
+            "LLM_VERIFY_PROVIDER 及豆包 / DeepSeek 密钥后可用。"
+        )
+        return
+    if not can_generate:
+        st.caption("管理员登录后可生成日报。")
+        return
+    if not selected_sectors:
+        st.info("请先选择板块。")
+        return
 
-        if st.button("生成 / 更新今日日报", key="generate_digest"):
-            st.session_state.digest_requested = True
-        if not st.session_state.get("digest_requested"):
-            st.caption(
-                f"点击按钮按板块归纳今天的新闻（最多 {MAX_DIGEST_SECTORS} 个板块，"
-                "结果缓存 6 小时）。"
-            )
-            return
+    if st.button("生成 / 更新今日日报", key="generate_digest"):
+        st.session_state.digest_requested = True
+    if not st.session_state.get("digest_requested"):
+        st.caption(
+            f"点击按钮按板块归纳今天的新闻（最多 {MAX_DIGEST_SECTORS} 个板块，"
+            "结果缓存 6 小时）。"
+        )
+        return
 
-        today = now_utc8_naive().date()
-        publish_times = parse_publish_times(sector_deduped_df)
-        today_df = sector_deduped_df[publish_times.dt.date.eq(today).fillna(False)]
+    today = now_utc8_naive().date()
+    publish_times = parse_publish_times(sector_deduped_df)
+    today_df = sector_deduped_df[publish_times.dt.date.eq(today).fillna(False)]
 
-        for sector in selected_sectors[:MAX_DIGEST_SECTORS]:
-            sector_df = today_df[today_df["sector"] == sector]
-            if sector_df.empty:
-                st.markdown(f"**{sector}**：今日暂无相关新闻。")
-                continue
-            records = build_digest_records(sort_news_by_importance(sector_df))
-            try:
-                with st.spinner(f"正在归纳「{sector}」..."):
-                    digest_text = cached_sector_digest(
-                        str(today),
-                        sector,
-                        records,
-                        llm_verifier_cache_key(llm_verifier),
-                        llm_verifier,
-                    )
-            except Exception as exc:
-                st.warning(f"「{sector}」日报生成失败：{describe_llm_error(exc)}")
-                continue
-            if digest_text:
-                st.markdown(f"**{sector}**：{digest_text}")
-            else:
-                st.markdown(f"**{sector}**：LLM 未返回有效内容。")
-        if len(selected_sectors) > MAX_DIGEST_SECTORS:
-            st.caption(f"已选板块较多，仅生成前 {MAX_DIGEST_SECTORS} 个板块的日报以控制成本。")
+    for sector in selected_sectors[:MAX_DIGEST_SECTORS]:
+        sector_df = today_df[today_df["sector"] == sector]
+        if sector_df.empty:
+            st.markdown(f"**{sector}**：今日暂无相关新闻。")
+            continue
+        records = build_digest_records(sort_news_by_importance(sector_df))
+        try:
+            with st.spinner(f"正在归纳「{sector}」..."):
+                digest_text = cached_sector_digest(
+                    str(today),
+                    sector,
+                    records,
+                    llm_verifier_cache_key(llm_verifier),
+                    llm_verifier,
+                )
+        except Exception as exc:
+            st.warning(f"「{sector}」日报生成失败：{describe_llm_error(exc)}")
+            continue
+        if digest_text:
+            st.markdown(f"**{sector}**：{digest_text}")
+        else:
+            st.markdown(f"**{sector}**：LLM 未返回有效内容。")
+    if len(selected_sectors) > MAX_DIGEST_SECTORS:
+        st.caption(f"已选板块较多，仅生成前 {MAX_DIGEST_SECTORS} 个板块的日报以控制成本。")
 
 
 def sentiment_pills_html(analyses) -> str:
@@ -796,7 +823,7 @@ def show_sector_section(
         if "analysis" in filtered_df.columns
         else ""
     )
-    st.markdown(
+    st.html(
         f"""
         <section class="sector-section">
             <div class="sector-heading">
@@ -809,7 +836,6 @@ def show_sector_section(
             {body_html}
         </section>
         """,
-        unsafe_allow_html=True,
     )
 
 
@@ -855,7 +881,7 @@ def show_external_events_section(
         if "analysis" in filtered_df.columns
         else ""
     )
-    st.markdown(
+    st.html(
         f"""
         <section class="sector-section">
             <div class="sector-heading">
@@ -868,7 +894,6 @@ def show_external_events_section(
             {body_html}
         </section>
         """,
-        unsafe_allow_html=True,
     )
 
 
@@ -904,43 +929,9 @@ def filter_overview_sectors(news: pd.DataFrame, sectors: list[str]) -> pd.DataFr
     return news.loc[matches]
 
 
-def render_market_brief(today: pd.DataFrame, hot_today: pd.DataFrame) -> None:
-    headline = "今天还没有新闻"
-    points = []
-    if not hot_today.empty:
-        lead = hot_today.iloc[0]
-        headline = str(lead.get("标题") or "今日重点")
-        direction = SENTIMENT_LABELS[_row_sentiment(lead)]
-        impact = IMPACT_LABELS.get(_row_analysis(lead).get("impact_level"), "低影响")
-        points.append(f"头条判断 · {direction} / {impact}：{_row_reason(lead)}")
-        points.extend(
-            f'{SENTIMENT_LABELS[_row_sentiment(row)]} · {row["标题"]}'
-            for _, row in hot_today.iloc[1:3].iterrows()
-        )
-    elif not today.empty:
-        headline = "今日已有新闻，暂无重点"
-    else:
-        points.append("后台会定时更新新闻，也可以在下方查看已有报道。")
-    bullets = "".join(f"<li>{escape(point)}</li>" for point in points)
-    points_html = (
-        f'<ul class="briefing-points">{bullets}</ul>'
-        f'<details class="briefing-more"><summary>展开要点</summary><ul>{bullets}</ul></details>'
-        if bullets else ""
-    )
-    st.markdown(
-        f"""
-        <section class="briefing">
-            <h2 class="briefing-label">今日速览</h2>
-            <p class="briefing-headline">{escape(headline)}</p>
-            {points_html}
-        </section>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
 def toggle_overview_filter(key: str, value: str) -> None:
     st.session_state[key] = "" if st.session_state.get(key) == value else value
+    st.session_state.news_navigation = "市场概览"
 
 
 def render_market_mood(today: pd.DataFrame, hot_count: int, *, followed_only: bool) -> None:
@@ -996,6 +987,8 @@ def render_sector_heat(today: pd.DataFrame) -> None:
 
 
 def render_overview_flow(
+    lead_area,
+    feed_area,
     pool: pd.DataFrame,
     sectors: list[str],
     time_range: str,
@@ -1004,17 +997,16 @@ def render_overview_flow(
     max_items: int,
     hot_links: set[str],
 ) -> None:
-    st.subheader("重点新闻")
     active_sector = st.session_state.overview_sector
     active_sentiment = st.session_state.overview_sentiment
     if active_sector or active_sentiment:
         labels = [active_sector, SENTIMENT_LABELS.get(active_sentiment, "")]
-        st.caption("概览筛选 · " + " · ".join(label for label in labels if label))
-        st.button(
-            "清除概览筛选", key="clear_overview_filters", on_click=clear_overview_filters
+        lead_area.button(
+            "清除筛选 · " + " · ".join(label for label in labels if label),
+            key="clear_overview_filters", on_click=clear_overview_filters,
         )
     if pool.empty:
-        st.info("缓存暂无此新闻类型的报道，后台任务会定时更新。")
+        lead_area.info("缓存暂无此新闻类型的报道，后台任务会定时更新。")
         return
 
     display = filter_overview_sectors(pool, [active_sector] if active_sector else sectors)
@@ -1024,41 +1016,38 @@ def render_overview_flow(
             [_row_sentiment(row) == active_sentiment for _, row in display.iterrows()]
         ]
     if display.empty:
-        st.info("当前筛选条件下暂无相关新闻。试试扩大时间范围或调整筛选条件。")
+        lead_area.info("当前筛选条件下暂无相关新闻。试试扩大时间范围或调整筛选条件。")
         return
 
     hot, used_fallback = select_hot_news(display, [active_sector] if active_sector else sectors)
-    if used_fallback:
-        st.caption("今日重点不足，已补充最近 24 小时的报道。")
-    if not hot.empty:
-        st.markdown(
-            "".join(render_news_item(row, hot_links) for _, row in hot.iterrows()),
-            unsafe_allow_html=True,
-        )
-
-    # 重点报道优先占据同组首位，其余报道继续沿用板块页的排序和事件折叠。
+    # 先沿用已有重点排序，再用其余报道补足新闻流；相似报道只占一个位置。
     hot_items = set(zip(hot["标题"], hot["原文链接"]))
     remaining = display.loc[
         [item not in hot_items for item in zip(display["标题"], display["原文链接"])]
     ]
-    if remaining.empty or len(hot) >= max_items:
-        return
     ordered = pd.concat(
         [hot, sort_news_by_importance(remaining).head(max_items * 3)], ignore_index=True
     )
-    clusters = group_similar_news(ordered)
-    additional = [(primary, related) for primary, related in clusters if primary >= len(hot)]
-    if additional:
-        st.subheader("更多新闻")
-        st.markdown(
-            "".join(
-                render_news_item(
-                    ordered.iloc[primary], hot_links,
-                    [ordered.iloc[position] for position in related],
-                )
-                for primary, related in additional[:max_items - len(hot)]
-            ),
-            unsafe_allow_html=True,
+    groups = group_similar_news(ordered)[:max_items]
+
+    def card(group: tuple[int, list[int]]) -> str:
+        primary, related = group
+        return render_news_item(
+            ordered.iloc[primary], hot_links, [ordered.iloc[position] for position in related]
+        )
+
+    first, *rest = groups
+    lead_is_today = not market_today(ordered.iloc[[first[0]]]).empty
+    heading = "今日导读" if lead_is_today else "近期导读"
+    lead_area.html(
+        f'<section class="edition-lead"><h2>{heading}</h2>{card(first)}</section>',
+    )
+    if rest:
+        feed_area.subheader("更多新闻")
+        if used_fallback:
+            feed_area.caption("今日重点不足，已补充最近 24 小时的报道。")
+        feed_area.html(
+            '<div class="edition-feed">' + "".join(card(group) for group in rest) + "</div>",
         )
 
 
@@ -1283,16 +1272,15 @@ def render_sector_selector(sectors_config: dict[str, Any]) -> list[str]:
         "followed_sectors", [sector for sector in DEFAULT_SELECTED_SECTORS if sector in sectors_config]
     )
     st.session_state.followed_sectors = [sector for sector in current if sector in sectors_config]
-    with st.popover(f"关注板块 · {len(st.session_state.followed_sectors)} 个", width="stretch"):
-        selected = st.multiselect(
-            "关注板块", options, key="followed_sectors", placeholder="搜索并选择板块",
-            on_change=clear_overview_sector,
+    selected = st.multiselect(
+        "关注板块", options, key="followed_sectors", placeholder="搜索并选择板块",
+        on_change=clear_overview_sector,
+    )
+    with st.container(horizontal=True, gap="small"):
+        st.button(
+            "全选", key="select_all_sectors", on_click=set_followed_sectors, args=(options,)
         )
-        with st.container(horizontal=True, gap="small"):
-            st.button(
-                "全选", key="select_all_sectors", on_click=set_followed_sectors, args=(options,)
-            )
-            st.button("清空", key="clear_all_sectors", on_click=set_followed_sectors, args=([],))
+        st.button("清空", key="clear_all_sectors", on_click=set_followed_sectors, args=([],))
     return selected
 
 
@@ -1449,16 +1437,26 @@ def main() -> None:
         sectors_config, sectors_config_error = default_sectors_config(), f"{exc}，已临时显示默认配置。"
         events_config, events_config_error = default_events_config(), None
     external_events = events_config["external_events"]
+    if "news" in st.query_params:
+        with st.container(key="article_detail"):
+            render_news_detail(
+                st.query_params["news"], sectors_config, external_events,
+                (sectors_config_error, events_config_error),
+            )
+        return
     event_to_sectors = events_config["event_to_sectors"]
     llm_verifier, llm_notice = get_llm_verifier()
 
-    render_dashboard_header()
-    with st.container(key="main_filters"):
-        time_col, search_col = st.columns([1, 2])
-        time_range = time_col.selectbox("时间范围", TIME_RANGE_OPTIONS, key="time_range")
-        keyword = search_col.text_input(
-            "关键词搜索", placeholder="标题、匹配关键词或来源…", key="keyword_search"
-        )
+    with st.container(key="edition_header"):
+        heading_col, filter_col = st.columns([4, 1], vertical_alignment="center")
+        with heading_col:
+            render_dashboard_header()
+        with filter_col.popover("筛选", icon=":material/tune:", width="stretch"):
+            keyword = st.text_input(
+                "关键词搜索", placeholder="标题、匹配关键词或来源…", key="keyword_search"
+            )
+            time_range = st.selectbox("时间范围", TIME_RANGE_OPTIONS, key="time_range")
+            selected_sectors = render_sector_selector(sectors_config)
 
     st.sidebar.header("筛选")
     show_config_notice()
@@ -1487,15 +1485,17 @@ def main() -> None:
         tab_labels.append("板块新闻")
     if show_external_events:
         tab_labels.append("外部事件")
-    tabs = dict(zip(tab_labels, st.tabs(tab_labels, key="news_navigation")))
+    tab_labels.append("热度榜")
+    if show_sector_news:
+        tab_labels.append("板块日报")
+    if "news_navigation" in st.session_state and st.session_state.news_navigation not in tab_labels:
+        st.session_state.news_navigation = "市场概览"
+    tabs = dict(zip(tab_labels, st.tabs(tab_labels, key="news_navigation", on_change="rerun")))
 
     with tabs["市场概览"]:
         with st.container(key="overview_top"):
-            brief_col, mood_col = st.columns([2, 1])
-        with st.container(key="overview_body"):
-            follow_col, flow_col, heat_col = st.columns([1, 2.7, 1.2])
-        with follow_col.container(key="follow_panel"):
-            selected_sectors = render_sector_selector(sectors_config)
+            lead_col, mood_col = st.columns([2, 1])
+        feed_area = st.container(key="overview_flow")
         overview_footer = st.container()
 
     st.sidebar.button(
@@ -1589,19 +1589,16 @@ def main() -> None:
     hot_today, _ = select_hot_news(followed_today, selected_sectors)
     hot_links = set(hot_today["原文链接"].astype(str)) - {""}
 
-    with brief_col:
-        render_market_brief(followed_today, hot_today)
+    render_overview_flow(
+        lead_col, feed_area, overview_pool, selected_sectors, time_range, keyword,
+        selected_sources, max_items, hot_links,
+    )
     with mood_col.container(border=True, key="market_mood"):
         render_market_mood(followed_today, len(hot_today), followed_only=bool(selected_sectors))
-    with flow_col.container(key="overview_flow"):
-        render_overview_flow(
-            overview_pool, selected_sectors, time_range, keyword, selected_sources,
-            max_items, hot_links,
-        )
-    with heat_col.container(border=True, key="heat_panel"):
+    with tabs["热度榜"]:
         render_sector_heat(today)
-        if show_sector_news:
-            st.divider()
+    if show_sector_news:
+        with tabs["板块日报"]:
             render_daily_digest_section(
                 llm_verifier, selected_sectors, sector_deduped_df,
                 can_generate=admin and not config_unavailable,
@@ -1616,7 +1613,7 @@ def main() -> None:
             st.subheader("板块新闻")
             st.caption(f"已选 {len(selected_sectors)} 个板块 · 时间范围：{time_range}")
             if not selected_sectors:
-                st.info("在市场概览的「关注板块」中选择至少一个板块。")
+                st.info("请打开顶部「筛选」，在「关注板块」中选择至少一个板块。")
             for sector in selected_sectors:
                 show_sector_section(
                     sector,
