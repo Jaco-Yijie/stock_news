@@ -47,7 +47,9 @@ def get_shared_session() -> requests.Session:
 
 
 class SupabaseError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _sanitize_credential(value: str) -> str:
@@ -121,7 +123,10 @@ class _SupabaseTable:
             raise SupabaseError(f"Supabase 请求失败（{type(exc).__name__}）") from None
 
         if response.status_code >= 400:
-            raise SupabaseError(f"Supabase 返回错误（HTTP {response.status_code}）")
+            raise SupabaseError(
+                f"Supabase 返回错误（HTTP {response.status_code}）",
+                status_code=response.status_code,
+            )
         return response
 
 class SupabaseNewsStore(_SupabaseTable):

@@ -10,10 +10,13 @@ import streamlit as st
 
 from classifier import LLMVerifier, extract_rule_keywords
 from config_store import (
+    ConfigUnavailableError,
     add_event_category,
     add_event_keyword,
     add_keyword,
     add_sector,
+    default_events_config,
+    default_sectors_config,
     extract_sector_keywords,
     remove_event_category,
     remove_event_keyword,
@@ -1855,8 +1858,16 @@ def main() -> None:
     for state_key, state_value in FILTER_STATE_DEFAULTS.items():
         st.session_state.setdefault(state_key, state_value)
 
-    sectors_config, sectors_config_error = try_load_sectors_config()
-    events_config, events_config_error = try_load_events_config()
+    # 远端配置暂时读不到时只临时显示默认配置，并暂停管理写操作：
+    # 此时刷新会按默认规则误删自定义事件的缓存，编辑配置会覆盖远端已保存的内容。
+    config_unavailable = False
+    try:
+        sectors_config, sectors_config_error = try_load_sectors_config(strict=True)
+        events_config, events_config_error = try_load_events_config(strict=True)
+    except ConfigUnavailableError as exc:
+        config_unavailable = True
+        sectors_config, sectors_config_error = default_sectors_config(), f"{exc}，已临时显示默认配置。"
+        events_config, events_config_error = default_events_config(), None
     external_events = events_config["external_events"]
     event_to_sectors = events_config["event_to_sectors"]
     llm_verifier, llm_notice = get_llm_verifier()
@@ -1923,7 +1934,9 @@ def main() -> None:
             st.session_state.cache_version += 1
         st.caption("可立即读取后台更新的缓存。")
         admin = render_admin_login()
-        if admin:
+        if admin and config_unavailable:
+            st.warning("远端配置暂时读取失败，管理操作已暂停。请稍后点击「重新加载缓存」重试。")
+        elif admin:
             keyword_tab, event_tab, data_tab = st.tabs(["关键词管理", "外部事件", "数据刷新"])
             with keyword_tab:
                 render_sector_config_manager(sectors_config)

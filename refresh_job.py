@@ -13,7 +13,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-from config_store import try_load_events_config, try_load_sectors_config
+from config_store import (
+    ConfigUnavailableError,
+    try_load_events_config,
+    try_load_sectors_config,
+)
 from llm_provider import load_llm_verifier_from_env
 from news_store import cache_backend_name, save_cache
 from notify import push_daily_report, push_important_news
@@ -58,8 +62,13 @@ def main(argv: list[str] | None = None) -> int:
         print("[error] 缺少 Supabase 持久化配置，未运行刷新。")
         return 1
 
-    sectors_config, sectors_config_error = try_load_sectors_config()
-    events_config, events_config_error = try_load_events_config()
+    try:
+        sectors_config, sectors_config_error = try_load_sectors_config(strict=True)
+        events_config, events_config_error = try_load_events_config(strict=True)
+    except ConfigUnavailableError as exc:
+        # 用默认配置继续跑会把自定义事件类别的缓存当成「缺少规则」删掉
+        print(f"[error] {exc}，为避免按默认配置误删缓存本次不刷新。")
+        return 1
     for error in (sectors_config_error, events_config_error):
         if error:
             print(f"[warning] {error}")

@@ -260,19 +260,34 @@ def _link_hash(link: str) -> str:
     return hashlib.sha1(str(link or "").encode("utf-8")).hexdigest()[:16]
 
 
+class PushHistoryUnavailable(RuntimeError):
+    """已配置 Supabase，但这次读不到推送历史。"""
+
+
 def load_push_history(path=PUSH_HISTORY_PATH) -> list[str]:
+    """读取已推送链接指纹。
+
+    远端读取失败时抛 PushHistoryUnavailable，而不是返回空列表：
+    空列表会让旧闻被重复推送，随后的保存还会把远端的完整历史覆盖掉。
+    """
     credentials = load_supabase_credentials()
     if credentials is not None:
         try:
             value = SupabaseConfigStore(credentials[0], credentials[1]).get_value(
                 PUSH_HISTORY_KEY
             )
-            if value:
-                data = json.loads(value)
-                if isinstance(data, list):
-                    return [str(item) for item in data]
-        except Exception:
-            pass
+        except Exception as exc:
+            if getattr(exc, "status_code", None) != 404:  # 404：app_config 表尚未创建
+                raise PushHistoryUnavailable(
+                    f"推送历史暂时读取失败（{type(exc).__name__}）"
+                ) from None
+            value = None
+        try:
+            data = json.loads(value) if value else None
+        except ValueError:
+            data = None
+        if isinstance(data, list):
+            return [str(item) for item in data]
     try:
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -321,12 +336,15 @@ def select_push_worthy(display_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_unpushed(df: pd.DataFrame, history: list[str]) -> pd.DataFrame:
+    """去掉已推送过的新闻；同一链接命中多个板块时只保留排在最前的一行。"""
     if df is None or df.empty:
         return df
-    pushed = set(history)
-    keep_mask = [
-        _link_hash(link) not in pushed for link in df["原文链接"].astype(str)
-    ]
+    seen = set(history)
+    keep_mask: list[bool] = []
+    for link in df["原文链接"].astype(str):
+        link_hash = _link_hash(link)
+        keep_mask.append(link_hash not in seen)
+        seen.add(link_hash)
     return df[keep_mask].reset_index(drop=True)
 
 
@@ -440,7 +458,11 @@ def push_important_news(cache_df: pd.DataFrame) -> None:
 
     display_df = _prepare_display(cache_df)
     candidates = select_push_worthy(display_df)
-    history = load_push_history()
+    try:
+        history = load_push_history()
+    except PushHistoryUnavailable as exc:
+        print(f"[warning] {exc}，为避免重复推送本次跳过。")
+        return
     fresh = filter_unpushed(candidates, history).head(MAX_PUSH_ITEMS)
     if fresh.empty:
         print("[info] 没有新的重要新闻需要推送。")
@@ -507,6 +529,10 @@ def push_daily_report(cache_df: pd.DataFrame, llm_verifier: Any = None) -> None:
     for error in errors:
         print(f"[warning] 早报推送失败 {error}")
     if len(errors) < len(notifiers):
-        history = load_push_history()
-        save_push_history(history + hashes_for(top_df))
+        try:
+            history = load_push_history()
+        except PushHistoryUnavailable as exc:
+            print(f"[warning] {exc}，本次早报未记入推送历史。")
+        else:
+            save_push_history(history + hashes_for(top_df))
         print(f"[info] 每日早报已推送（{len(top_df)} 条要闻）。")
