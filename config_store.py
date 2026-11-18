@@ -24,15 +24,27 @@ def _get_config_store() -> SupabaseConfigStore | None:
     return SupabaseConfigStore(credentials[0], credentials[1])
 
 
+class ConfigUnavailableError(RuntimeError):
+    """已配置 Supabase，但这次读不到远端配置（网络抖动、5xx 等）。"""
+
+
 def _load_remote_config(config_key: str) -> Any | None:
-    """从 Supabase 读取配置；未配置/表缺失/网络失败时返回 None（退回本地）。"""
+    """从 Supabase 读取配置；未配置或表尚未创建时返回 None（退回本地）。
+
+    读取失败不能当成「远端没有配置」：退回本地默认配置后，自定义事件类别的
+    缓存会被判为「缺少规则」而删除，编辑配置还会用本地内容覆盖远端。
+    """
     store = _get_config_store()
     if store is None:
         return None
     try:
         value = store.get_value(config_key)
-    except Exception:
-        return None
+    except Exception as exc:
+        if getattr(exc, "status_code", None) == 404:  # app_config 表尚未创建
+            return None
+        raise ConfigUnavailableError(
+            f"远端配置暂时读取失败（{type(exc).__name__}）"
+        ) from None
     if not value:
         return None
     return json.loads(value)
@@ -197,9 +209,16 @@ def load_sectors_config() -> dict[str, list[str] | dict[str, Any]]:
     return sectors
 
 
-def try_load_sectors_config() -> tuple[dict[str, list[str] | dict[str, Any]], str | None]:
+def try_load_sectors_config(
+    *, strict: bool = False
+) -> tuple[dict[str, list[str] | dict[str, Any]], str | None]:
+    """strict=True 时远端读取失败会抛 ConfigUnavailableError，供会写缓存的任务中止。"""
     try:
         return load_sectors_config(), None
+    except ConfigUnavailableError:
+        if strict:
+            raise
+        return default_sectors_config(), "远端板块关键词配置暂时读取失败，已临时使用默认配置"
     except Exception as exc:
         return default_sectors_config(), f"读取板块关键词配置失败，已使用默认配置：{type(exc).__name__}"
 
@@ -302,9 +321,14 @@ def load_events_config() -> dict[str, Any]:
     return events_config
 
 
-def try_load_events_config() -> tuple[dict[str, Any], str | None]:
+def try_load_events_config(*, strict: bool = False) -> tuple[dict[str, Any], str | None]:
+    """strict=True 时远端读取失败会抛 ConfigUnavailableError，供会写缓存的任务中止。"""
     try:
         return load_events_config(), None
+    except ConfigUnavailableError:
+        if strict:
+            raise
+        return default_events_config(), "远端外部事件配置暂时读取失败，已临时使用默认配置"
     except Exception as exc:
         return default_events_config(), f"读取外部事件配置失败，已使用默认配置：{type(exc).__name__}"
 

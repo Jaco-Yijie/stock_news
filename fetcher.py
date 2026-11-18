@@ -140,7 +140,12 @@ def _normalize_link_for_dedupe(value: Any) -> str:
     parsed = urlsplit(link)
     if parsed.scheme or parsed.netloc:
         path = parsed.path.rstrip("/")
-        return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+        base = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+        # 快讯类链接是「列表页 + #内容指纹」（见 _stream_link），指纹才是这条新闻的身份；
+        # 丢掉它会让同一来源的所有快讯被当成同一条。
+        if base in _STREAM_BASE_LINK_KEYS and STREAM_FRAGMENT_PATTERN.fullmatch(parsed.fragment):
+            return f"{base}#{parsed.fragment}"
+        return base
 
     return link.split("?", 1)[0].split("#", 1)[0].rstrip("/")
 
@@ -528,6 +533,9 @@ _STREAM_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
 _STREAM_CACHE_LOCK = Lock()
 
 
+STREAM_FRAGMENT_PATTERN = re.compile(r"[0-9a-f]{12}")
+
+
 def _stream_link(base_link: str, title: str, publish_time: str) -> str:
     # 快讯类接口没有单条 URL，用真实列表页 + 内容指纹片段保证链接唯一可去重
     digest = hashlib.sha1(f"{title}|{publish_time}".encode("utf-8")).hexdigest()[:12]
@@ -579,6 +587,10 @@ def _normalize_stream_frame(
 STREAM_SOURCES: tuple[tuple[str, str, str, str], ...] = (
     ("cls_telegraph", "stock_telegraph_cls", "财联社电报", "https://www.cls.cn/telegraph"),
     ("sina_global", "stock_info_global_sina", "新浪财经快讯", "https://finance.sina.com.cn/7x24/"),
+)
+# 与 _normalize_link_for_dedupe 归一化后的形式一致（去掉末尾斜杠）
+_STREAM_BASE_LINK_KEYS = frozenset(
+    base_link.rstrip("/") for _, _, _, base_link in STREAM_SOURCES
 )
 
 

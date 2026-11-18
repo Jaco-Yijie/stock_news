@@ -79,3 +79,27 @@ def test_dashboard_writes_require_admin_and_logout_revokes_access(monkeypatch):
 
     by_label(app.button, "退出管理模式").click().run()
     assert "清空缓存" not in labels()
+
+
+def test_dashboard_pauses_admin_writes_when_remote_config_is_unreadable(monkeypatch):
+    class DownConfigStore:
+        def get_value(self, key):
+            raise RuntimeError("Supabase 503")
+
+        def set_value(self, *args, **kwargs):
+            raise AssertionError("配置读取失败时不应写远端配置")
+
+    monkeypatch.setattr(config_store, "_get_config_store", lambda: DownConfigStore())
+    monkeypatch.setattr(news_store, "get_supabase_store", lambda: None)
+    monkeypatch.setattr(llm_provider, "load_llm_verifier_from_env", lambda: (None, None))
+    app = AppTest.from_file(BASE_DIR / "main.py")
+    app.secrets["DASHBOARD_ADMIN_PASSWORD"] = "synthetic-test-only"
+    app.run()
+    next(item for item in app.text_input if item.label == "管理员口令").set_value("synthetic-test-only")
+    next(button for button in app.button if button.label == "登录").click().run()
+
+    assert not app.exception
+    labels = {button.label for button in app.button}
+    assert "退出管理模式" in labels
+    assert not ({"清空缓存", "全量刷新", "增量刷新"} & labels)
+    assert any("管理操作已暂停" in item.value for item in app.warning)
